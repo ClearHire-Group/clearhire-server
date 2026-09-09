@@ -1,0 +1,7 @@
+.env
+/bin/
+/tmp/
+*.log
+
+# Nota de trabalho pra IA, não documentação de time — fica local.
+CLAUDE.md
