@@ -16,3 +16,15 @@ type UpdateCultureProfileRequest struct {
 	ImportanceNote string   `json:"importanceNote"`
 	Values         []string `json:"values"`
 }
+
+// Response é o que POST /companies e GET /companies/:id devolvem — nunca o
+// model direto (ele não tem tags json e não deveria: model é forma interna,
+// não contrato de API).
+type Response struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+func toResponse(c *Company) *Response {
+	return &Response{ID: c.ID, Name: c.Name}
+}

@@ -2,6 +2,7 @@
 /bin/
 /tmp/
 *.log
+/.devdb/
 
 # Nota de trabalho pra IA, não documentação de time — fica local.
 CLAUDE.md

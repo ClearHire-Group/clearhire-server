@@ -19,7 +19,18 @@ func New(cfg *config.Config) *fiber.App {
 
 	app.Use(recover.New())
 	app.Use(logger.New())
-	app.Use(cors.New())
+	// Origem explícita + credenciais habilitadas — necessário pro cookie
+	// httpOnly de refresh token funcionar em qualquer topologia que não
+	// seja "mesma origem via proxy" (dev usa o proxy do ng serve e nem
+	// depende disto, mas uma implantação futura pode ser cross-origin de
+	// verdade). Nota: o Fiber recusa subir (panic) se AllowCredentials for
+	// true com AllowOrigins resolvendo pra "*" — rede de segurança own: um
+	// CORS_ORIGIN mal configurado vira crash no boot, não buraco silencioso.
+	app.Use(cors.New(cors.Config{
+		AllowOrigins:     cfg.CORSOrigin,
+		AllowCredentials: true,
+		AllowMethods:     "GET,POST,PUT,PATCH,DELETE",
+	}))
 
 	app.Get("/health", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"status": "ok"})

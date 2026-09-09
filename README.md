@@ -4,6 +4,9 @@ API do Clearhire, em Go + [Fiber](https://gofiber.io). Backend do protótipo
 frontend em `clearhire-app`; a modelagem de dados que este serviço implementa
 está documentada e validada em `migrations/0001_init.sql`.
 
+Contrato de cada endpoint (request/response, status codes, o que já existe
+de verdade vs. o que ainda é esqueleto) está em [`docs/API.md`](docs/API.md).
+
 ## Stack
 
 - Go 1.25, [Fiber v2](https://gofiber.io) (HTTP)

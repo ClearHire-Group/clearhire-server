@@ -30,10 +30,10 @@ func main() {
 	}
 	defer db.Close()
 
-	f := factory.New(db)
+	f := factory.New(db, cfg)
 
 	app := server.New(cfg)
-	server.RegisterRoutes(app, f)
+	server.RegisterRoutes(app, f, cfg)
 
 	if err := app.Listen(":" + cfg.Port); err != nil {
 		log.Fatalf("falha ao iniciar o servidor: %v", err)
