@@ -21,6 +21,7 @@ func RegisterRoutes(app *fiber.App, f *factory.Factory, cfg *config.Config) {
 	f.CompanyHandler.RegisterRoutes(protected)
 	f.UserHandler.RegisterRoutes(protected)
 	f.CampaignHandler.RegisterRoutes(protected)
+	f.CampaignHandler.RegisterReportsRoutes(protected)
 	f.CandidateHandler.RegisterRoutes(protected)
 	f.TalentHandler.RegisterRoutes(protected)
 }
