@@ -27,10 +27,13 @@ type Handler struct {
 	// cookieSecure liga a flag Secure do cookie de refresh — exigida fora de
 	// development, onde a API real corre atrás de HTTPS.
 	cookieSecure bool
+	// exposeResetLinks controla se POST /auth/password-reset devolve o link cru na resposta —
+	// só em development, onde não existe SMTP real (ver pkg/mailer.LogSender).
+	exposeResetLinks bool
 }
 
-func NewHandler(service Service, cookieSecure bool) *Handler {
-	return &Handler{service: service, cookieSecure: cookieSecure}
+func NewHandler(service Service, cookieSecure, exposeResetLinks bool) *Handler {
+	return &Handler{service: service, cookieSecure: cookieSecure, exposeResetLinks: exposeResetLinks}
 }
 
 // RegisterRoutes pluga os endpoints de auth no grupo de rotas recebido.
@@ -44,6 +47,8 @@ func (h *Handler) RegisterRoutes(router fiber.Router) {
 	group.Post("/refresh", h.Refresh)
 	group.Post("/logout", h.Logout)
 	group.Post("/invitations/:token/accept", h.AcceptInvitation)
+	group.Post("/password-reset", middleware.RateLimit(5, time.Minute), h.RequestPasswordReset)
+	group.Post("/password-reset/:token", h.ConfirmPasswordReset)
 }
 
 func (h *Handler) Login(c *fiber.Ctx) error {
@@ -124,7 +129,50 @@ func (h *Handler) AcceptInvitation(c *fiber.Ctx) error {
 	if err := c.BodyParser(&req); err != nil {
 		return response.Err(c, fiber.StatusBadRequest, "payload inválido")
 	}
-	if err := h.service.AcceptInvitation(c.Context(), c.Params("token"), req); err != nil {
+	if err := validator.Validate(req); err != nil {
+		return response.Err(c, fiber.StatusBadRequest, "nome e senha (mínimo 8 caracteres) são obrigatórios")
+	}
+
+	email, err := h.service.AcceptInvitation(c.Context(), c.Params("token"), req)
+	if err != nil {
+		return h.respondError(c, err)
+	}
+	return response.OK(c, &AcceptInvitationResponse{Email: email})
+}
+
+// RequestPasswordReset sempre responde 200 — nunca revela se o e-mail existe (mesma filosofia de
+// Login). resetLink só vem preenchido em development (ver Handler.exposeResetLinks).
+func (h *Handler) RequestPasswordReset(c *fiber.Ctx) error {
+	var req ForgotPasswordRequest
+	if err := c.BodyParser(&req); err != nil {
+		return response.Err(c, fiber.StatusBadRequest, "payload inválido")
+	}
+	if err := validator.Validate(req); err != nil {
+		return response.Err(c, fiber.StatusBadRequest, "e-mail inválido")
+	}
+
+	link, err := h.service.RequestPasswordReset(c.Context(), req.Email)
+	if err != nil {
+		return h.respondError(c, err)
+	}
+
+	resp := &ForgotPasswordResponse{}
+	if h.exposeResetLinks {
+		resp.ResetLink = link
+	}
+	return response.OK(c, resp)
+}
+
+func (h *Handler) ConfirmPasswordReset(c *fiber.Ctx) error {
+	var req ResetPasswordRequest
+	if err := c.BodyParser(&req); err != nil {
+		return response.Err(c, fiber.StatusBadRequest, "payload inválido")
+	}
+	if err := validator.Validate(req); err != nil {
+		return response.Err(c, fiber.StatusBadRequest, "senha deve ter no mínimo 8 caracteres")
+	}
+
+	if err := h.service.ConfirmPasswordReset(c.Context(), c.Params("token"), req.NewPassword); err != nil {
 		return h.respondError(c, err)
 	}
 	return response.OK(c, nil)

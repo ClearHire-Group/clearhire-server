@@ -20,9 +20,18 @@ type RefreshToken struct {
 	RevokedAt *time.Time
 }
 
-// Repository isola o acesso a refresh_tokens — o service nunca fala SQL
-// diretamente. password_reset_tokens fica pra quando o fluxo "esqueci minha
-// senha" for implementado; não faz parte do login.
+// PasswordResetToken é uma linha de password_reset_tokens. UsedAt é ponteiro porque a coluna é
+// nulável — um token ainda não resgatado tem UsedAt == nil.
+type PasswordResetToken struct {
+	ID        string
+	UserID    string
+	TokenHash string
+	ExpiresAt time.Time
+	UsedAt    *time.Time
+}
+
+// Repository isola o acesso a refresh_tokens e password_reset_tokens — o
+// service nunca fala SQL diretamente.
 type Repository interface {
 	StoreRefreshToken(ctx context.Context, userID, tokenHash string, expiresAt time.Time) error
 	RevokeRefreshToken(ctx context.Context, tokenHash string) error
@@ -31,6 +40,10 @@ type Repository interface {
 	// usado quando um token já revogado é reapresentado (reuso = sinal de
 	// token roubado/duplicado), não só o token único usado numa troca normal.
 	RevokeAllForUser(ctx context.Context, userID string) error
+
+	CreatePasswordResetToken(ctx context.Context, userID, tokenHash string, expiresAt time.Time) error
+	FindPasswordResetTokenByHash(ctx context.Context, tokenHash string) (*PasswordResetToken, error)
+	MarkPasswordResetTokenUsed(ctx context.Context, id string) error
 }
 
 type postgresRepository struct {
@@ -72,5 +85,34 @@ func (r *postgresRepository) FindRefreshTokenByHash(ctx context.Context, tokenHa
 
 func (r *postgresRepository) RevokeAllForUser(ctx context.Context, userID string) error {
 	_, err := r.db.Exec(ctx, "update refresh_tokens set revoked_at = now() where user_id = $1 and revoked_at is null", userID)
+	return err
+}
+
+func (r *postgresRepository) CreatePasswordResetToken(ctx context.Context, userID, tokenHash string, expiresAt time.Time) error {
+	_, err := r.db.Exec(ctx, `
+		insert into password_reset_tokens (user_id, token_hash, expires_at)
+		values ($1, $2, $3)
+	`, userID, tokenHash, expiresAt)
+	return err
+}
+
+func (r *postgresRepository) FindPasswordResetTokenByHash(ctx context.Context, tokenHash string) (*PasswordResetToken, error) {
+	row := r.db.QueryRow(ctx, `
+		select id, user_id, token_hash, expires_at, used_at
+		from password_reset_tokens where token_hash = $1
+	`, tokenHash)
+	var t PasswordResetToken
+	err := row.Scan(&t.ID, &t.UserID, &t.TokenHash, &t.ExpiresAt, &t.UsedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &t, nil
+}
+
+func (r *postgresRepository) MarkPasswordResetTokenUsed(ctx context.Context, id string) error {
+	_, err := r.db.Exec(ctx, "update password_reset_tokens set used_at = now() where id = $1", id)
 	return err
 }

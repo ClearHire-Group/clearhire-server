@@ -25,3 +25,26 @@ type AcceptInvitationRequest struct {
 	Name     string `json:"name" validate:"required"`
 	Password string `json:"password" validate:"required,min=8"`
 }
+
+// AcceptInvitationResponse devolve o e-mail do convite aceito — o front usa isso pra pré-preencher
+// a tela de login (aceitar convite não loga automaticamente, mesmo padrão de POST /companies).
+type AcceptInvitationResponse struct {
+	Email string `json:"email"`
+}
+
+// ForgotPasswordRequest é o payload de POST /auth/password-reset.
+type ForgotPasswordRequest struct {
+	Email string `json:"email" validate:"required,email"`
+}
+
+// ForgotPasswordResponse nunca revela se o e-mail existe — ResetLink só vem preenchido em
+// development (sem SMTP real, ver pkg/mailer.LogSender).
+type ForgotPasswordResponse struct {
+	ResetLink string `json:"resetLink,omitempty"`
+}
+
+// ResetPasswordRequest é o payload de POST /auth/password-reset/:token — o token vem da URL,
+// mesmo padrão de AcceptInvitationRequest.
+type ResetPasswordRequest struct {
+	NewPassword string `json:"newPassword" validate:"required,min=8"`
+}

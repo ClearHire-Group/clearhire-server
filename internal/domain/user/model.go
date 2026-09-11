@@ -23,3 +23,45 @@ type User struct {
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 }
+
+type InvitationStatus string
+
+const (
+	InvitationPending  InvitationStatus = "pending"
+	InvitationAccepted InvitationStatus = "accepted"
+	InvitationExpired  InvitationStatus = "expired"
+	InvitationRevoked  InvitationStatus = "revoked"
+)
+
+// Invitation é uma linha de user_invitations — o owner convida o segundo assento de RH, que usa
+// o token pra criar a própria senha e virar um User com role=member (ver auth.Service.AcceptInvitation).
+type Invitation struct {
+	ID              string
+	CompanyID       string
+	Email           string
+	InvitedByUserID string
+	TokenHash       string
+	Status          InvitationStatus
+	ExpiresAt       time.Time
+	AcceptedAt      *time.Time
+	CreatedAt       time.Time
+}
+
+// TeamMember é a visão que a tela Equipe consome — User ativo/inativo e Invitation pendente
+// projetados na mesma forma, porque pra quem olha a lista da empresa os dois são "um assento".
+type TeamMemberStatus string
+
+const (
+	TeamMemberActive   TeamMemberStatus = "active"
+	TeamMemberInactive TeamMemberStatus = "inactive"
+	TeamMemberPending  TeamMemberStatus = "pending"
+)
+
+type TeamMember struct {
+	ID        string
+	Name      string
+	Email     string
+	Role      Role
+	Status    TeamMemberStatus
+	CreatedAt time.Time
+}
