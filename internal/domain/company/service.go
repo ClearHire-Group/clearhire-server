@@ -3,6 +3,7 @@ package company
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"golang.org/x/crypto/bcrypt"
@@ -15,10 +16,17 @@ import (
 // uniqueViolationCode é o SQLSTATE do Postgres pra unique_violation.
 const uniqueViolationCode = "23505"
 
+// maxCultureValues é um limite de bom senso pros chips de "valores organizacionais" —
+// não especificado em lugar nenhum, só evita abuso (uma lista de 200 chips não serve
+// pra nada na UI).
+const maxCultureValues = 10
+
 type Service interface {
-	Get(ctx context.Context, id string) (*Company, error)
 	Register(ctx context.Context, req RegisterCompanyRequest) (*Company, error)
-	UpdateCultureProfile(ctx context.Context, id string, req UpdateCultureProfileRequest) error
+	// GetProfile e UpdateProfile são o que a tela Configurações (perfil cultural) usa —
+	// sempre escopado pela empresa autenticada, nunca por um :id de rota.
+	GetProfile(ctx context.Context, companyID string) (*Profile, error)
+	UpdateProfile(ctx context.Context, companyID string, req UpdateCultureProfileRequest) (*Profile, error)
 }
 
 type service struct {
@@ -36,17 +44,6 @@ type service struct {
 // uma operação de negócio.
 func NewService(repo Repository, users user.Repository, withTx func(ctx context.Context, fn func(db database.DB) error) error) Service {
 	return &service{repo: repo, users: users, withTx: withTx}
-}
-
-func (s *service) Get(ctx context.Context, id string) (*Company, error) {
-	c, err := s.repo.FindByID(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	if c == nil {
-		return nil, apperror.NotFound("empresa não encontrada")
-	}
-	return c, nil
 }
 
 func (s *service) Register(ctx context.Context, req RegisterCompanyRequest) (*Company, error) {
@@ -98,6 +95,62 @@ func (s *service) Register(ctx context.Context, req RegisterCompanyRequest) (*Co
 	return c, nil
 }
 
-func (s *service) UpdateCultureProfile(ctx context.Context, id string, req UpdateCultureProfileRequest) error {
-	return s.repo.UpdateCultureProfile(ctx, id, req)
+func (s *service) GetProfile(ctx context.Context, companyID string) (*Profile, error) {
+	c, err := s.repo.FindByID(ctx, companyID)
+	if err != nil {
+		return nil, apperror.Internal("falha ao buscar perfil da empresa")
+	}
+	if c == nil {
+		return nil, apperror.NotFound("empresa não encontrada")
+	}
+
+	values, err := s.repo.ValuesByCompany(ctx, companyID)
+	if err != nil {
+		return nil, apperror.Internal("falha ao buscar valores organizacionais")
+	}
+
+	return &Profile{
+		ID:             c.ID,
+		Name:           c.Name,
+		Tone:           c.CultureTone,
+		ImportanceNote: c.CultureImportanceNote,
+		Values:         values,
+	}, nil
+}
+
+func (s *service) UpdateProfile(ctx context.Context, companyID string, req UpdateCultureProfileRequest) (*Profile, error) {
+	values := normalizeCultureValues(req.Values)
+
+	// Uma escrita em companies + substituir company_culture_values inteira: mesma
+	// justificativa de atomicidade do Register — uma falha no meio não pode deixar
+	// tone/importanceNote gravados com metade dos valores antigos e metade dos novos.
+	err := s.withTx(ctx, func(db database.DB) error {
+		return NewRepository(db).UpdateCultureProfile(ctx, companyID, strings.TrimSpace(req.Tone), strings.TrimSpace(req.ImportanceNote), values)
+	})
+	if err != nil {
+		return nil, apperror.Internal("falha ao salvar perfil da empresa")
+	}
+
+	return s.GetProfile(ctx, companyID)
+}
+
+// normalizeCultureValues remove espaços/entradas vazias e deduplica mantendo a ordem
+// original (a ordem é o que vira `position` na hora de persistir). Validação de
+// tamanho/quantidade já aconteceu via tag do validator no handler — isto aqui só limpa
+// o que passou pela validação estrutural mas ainda pode ter espaço sobrando ou repetição.
+func normalizeCultureValues(raw []string) []string {
+	seen := make(map[string]bool, len(raw))
+	values := make([]string, 0, len(raw))
+	for _, v := range raw {
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" || seen[trimmed] {
+			continue
+		}
+		seen[trimmed] = true
+		values = append(values, trimmed)
+		if len(values) == maxCultureValues {
+			break
+		}
+	}
+	return values
 }

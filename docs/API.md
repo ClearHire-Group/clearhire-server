@@ -96,6 +96,69 @@ Público. Devolve um par de tokens.
 
 ---
 
+### `GET /company-profile` — ler perfil cultural da empresa
+
+Protegido. Sempre a empresa do usuário autenticado — não existe parâmetro de
+rota; não é possível ler o perfil de outra empresa.
+
+**Resposta — `200 OK`**
+```json
+{
+  "success": true,
+  "data": {
+    "name": "Aurora Tech",
+    "values": ["Transparência radical", "Autonomia com responsabilidade"],
+    "tone": "Direto, mas empático...",
+    "importance": "Times pequenos e autônomos..."
+  }
+}
+```
+`values`/`tone`/`importance` vêm vazios (`[]`/`""`) numa empresa recém-cadastrada
+— ninguém preencheu ainda, não é erro.
+
+**Erros**
+| Status | Quando |
+|---|---|
+| `401` | token ausente/inválido/expirado |
+
+---
+
+### `POST /company-profile` — atualizar perfil cultural da empresa
+
+Protegido. Substitui `tone`/`importance` e a lista de `values` inteira (não é
+um merge — mandar `values` sem um item existente remove esse item).
+
+**Request**
+```json
+{
+  "tone": "Direto, mas empático...",
+  "importance": "Times pequenos e autônomos...",
+  "values": ["Transparência radical", "Autonomia com responsabilidade"]
+}
+```
+
+| Campo | Obrigatório | Regra |
+|---|---|---|
+| `tone` | não | máximo 2000 caracteres |
+| `importance` | não | máximo 2000 caracteres |
+| `values` | não | máximo 10 itens, cada um até 60 caracteres; espaços nas pontas e itens repetidos são limpos automaticamente pelo servidor |
+
+**Resposta — `200 OK`**: mesmo formato de `GET /company-profile`, já com o
+valor salvo.
+
+**Erros**
+| Status | Quando |
+|---|---|
+| `400` | payload inválido (item de `values` fora do limite de tamanho, mais de 10 itens, etc.) |
+| `401` | token ausente/inválido/expirado |
+
+**Nota:** não existe override por campanha — toda nova campanha herda este
+perfil no momento da criação. Alterar aqui não re-processa campanhas já
+criadas (hoje nada lê este perfil no momento de pontuar um candidato; quando
+o scoring de Fit Cultural existir, esta nota precisa ser revisitada).
+
+---
+
 ## Ainda não implementado
 
 Rota registrada e respondendo `501 não implementado` (sem lógica por trás):
@@ -103,7 +166,6 @@ Rota registrada e respondendo `501 não implementado` (sem lógica por trás):
 | Endpoint | Seria |
 |---|---|
 | `POST /auth/invitations/:token/accept` | segundo RH aceita convite e define senha |
-| `GET /companies/:id` · `PATCH /companies/:id/culture` | ler/editar perfil cultural da empresa |
 | `GET /users/:id` · `PATCH /users/:id` · `DELETE /users/:id` | perfil de RH / desativar assento |
 | `GET /campaigns` · `POST /campaigns` · `GET /campaigns/:id` · `POST /campaigns/:id/toggle-pause` | vagas |
 | `GET /candidates/:id` · `POST /candidates/:id/decisions` | candidatos e decisões manuais |

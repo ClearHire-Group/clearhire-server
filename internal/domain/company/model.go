@@ -13,3 +13,14 @@ type Company struct {
 	CreatedAt             time.Time
 	UpdatedAt             time.Time
 }
+
+// Profile é a visão de "perfil cultural" que a tela Configurações consome —
+// Company (a linha de companies) + a lista ordenada de company_culture_values,
+// que é tabela filha, não coluna. Camada de serviço, nunca persistido como tal.
+type Profile struct {
+	ID             string
+	Name           string
+	Tone           string
+	ImportanceNote string
+	Values         []string
+}

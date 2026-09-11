@@ -9,17 +9,19 @@ type RegisterCompanyRequest struct {
 	OwnerPassword string `json:"ownerPassword" validate:"required,min=8"`
 }
 
-// UpdateCultureProfileRequest é o payload de PATCH /companies/:id/culture —
-// tela de Configurações (perfil cultural da empresa).
+// UpdateCultureProfileRequest é o payload de POST /company-profile — tela de
+// Configurações (perfil cultural da empresa). JSON tag de ImportanceNote é
+// "importance" de propósito: bate com CompanyProfile.importance do frontend
+// (nome do campo Go segue a coluna SQL culture_importance_note, só o contrato
+// HTTP precisa bater com o outro lado).
 type UpdateCultureProfileRequest struct {
-	Tone           string   `json:"tone"`
-	ImportanceNote string   `json:"importanceNote"`
-	Values         []string `json:"values"`
+	Tone           string   `json:"tone" validate:"max=2000"`
+	ImportanceNote string   `json:"importance" validate:"max=2000"`
+	Values         []string `json:"values" validate:"max=10,dive,min=1,max=60"`
 }
 
-// Response é o que POST /companies e GET /companies/:id devolvem — nunca o
-// model direto (ele não tem tags json e não deveria: model é forma interna,
-// não contrato de API).
+// Response é o que POST /companies devolve — nunca o model direto (ele não
+// tem tags json e não deveria: model é forma interna, não contrato de API).
 type Response struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
@@ -27,4 +29,26 @@ type Response struct {
 
 func toResponse(c *Company) *Response {
 	return &Response{ID: c.ID, Name: c.Name}
+}
+
+// ProfileResponse é o que GET/POST /company-profile devolvem — espelha
+// CompanyProfile do frontend (clearhire-app/src/app/core/models.ts) campo a campo.
+type ProfileResponse struct {
+	Name       string   `json:"name"`
+	Values     []string `json:"values"`
+	Tone       string   `json:"tone"`
+	Importance string   `json:"importance"`
+}
+
+func toProfileResponse(p *Profile) *ProfileResponse {
+	values := p.Values
+	if values == nil {
+		values = []string{}
+	}
+	return &ProfileResponse{
+		Name:       p.Name,
+		Values:     values,
+		Tone:       p.Tone,
+		Importance: p.ImportanceNote,
+	}
 }

@@ -26,11 +26,13 @@ func (h *Handler) RegisterPublicRoutes(router fiber.Router) {
 	router.Group("/companies", middleware.RateLimit(5, time.Minute)).Post("/", h.Register)
 }
 
-// RegisterRoutes pluga o restante, protegido por autenticação.
-func (h *Handler) RegisterRoutes(router fiber.Router) {
-	group := router.Group("/companies")
-	group.Get("/:id", h.Get)
-	group.Patch("/:id/culture", h.UpdateCultureProfile)
+// RegisterProfileRoutes pluga o perfil cultural da empresa — sempre a empresa do
+// usuário autenticado (middleware.CompanyID), nunca um :id de rota. Não existe "buscar
+// outra empresa por id" neste app: cada RH só enxerga a própria.
+func (h *Handler) RegisterProfileRoutes(router fiber.Router) {
+	group := router.Group("/company-profile")
+	group.Get("/", h.GetProfile)
+	group.Post("/", h.UpdateProfile)
 }
 
 // Register é a única rota deste domínio fora do grupo autenticado — é o
@@ -46,27 +48,39 @@ func (h *Handler) Register(c *fiber.Ctx) error {
 
 	result, err := h.service.Register(c.Context(), req)
 	if err != nil {
-		var appErr *apperror.AppError
-		if errors.As(err, &appErr) {
-			return response.Err(c, appErr.Code, appErr.Message)
-		}
-		return response.Err(c, fiber.StatusInternalServerError, "erro interno")
+		return h.respondError(c, err)
 	}
 	return response.Created(c, toResponse(result))
 }
 
-func (h *Handler) Get(c *fiber.Ctx) error {
-	result, err := h.service.Get(c.Context(), c.Params("id"))
+func (h *Handler) GetProfile(c *fiber.Ctx) error {
+	result, err := h.service.GetProfile(c.Context(), middleware.CompanyID(c))
 	if err != nil {
-		var appErr *apperror.AppError
-		if errors.As(err, &appErr) {
-			return response.Err(c, appErr.Code, appErr.Message)
-		}
-		return response.Err(c, fiber.StatusInternalServerError, "erro interno")
+		return h.respondError(c, err)
 	}
-	return response.OK(c, toResponse(result))
+	return response.OK(c, toProfileResponse(result))
 }
 
-func (h *Handler) UpdateCultureProfile(c *fiber.Ctx) error {
-	return response.Err(c, fiber.StatusNotImplemented, "não implementado")
+func (h *Handler) UpdateProfile(c *fiber.Ctx) error {
+	var req UpdateCultureProfileRequest
+	if err := c.BodyParser(&req); err != nil {
+		return response.Err(c, fiber.StatusBadRequest, "payload inválido")
+	}
+	if err := validator.Validate(req); err != nil {
+		return response.Err(c, fiber.StatusBadRequest, "dados inválidos")
+	}
+
+	result, err := h.service.UpdateProfile(c.Context(), middleware.CompanyID(c), req)
+	if err != nil {
+		return h.respondError(c, err)
+	}
+	return response.OK(c, toProfileResponse(result))
+}
+
+func (h *Handler) respondError(c *fiber.Ctx, err error) error {
+	var appErr *apperror.AppError
+	if errors.As(err, &appErr) {
+		return response.Err(c, appErr.Code, appErr.Message)
+	}
+	return response.Err(c, fiber.StatusInternalServerError, "erro interno")
 }
