@@ -34,6 +34,7 @@ func (h *Handler) RegisterRoutes(router fiber.Router) {
 	// colide de verdade com "/:id" (que só casa um segmento), mas mantém as duas rotas de convite
 	// juntas facilita ler.
 	group.Delete("/invitations/:id", h.CancelInvitation)
+	group.Post("/invitations/:id/resend", h.ResendInvitation)
 	// Rate limit aqui de propósito: a partir desta mudança o endpoint aceita uma senha no corpo
 	// (ver DeactivateRequest) — sem limite, seria um oráculo de força bruta contra a senha do
 	// próprio owner escondido atrás de uma rota autenticada. Mesmo padrão de POST /auth/login.
@@ -114,6 +115,23 @@ func (h *Handler) CancelInvitation(c *fiber.Ctx) error {
 		return h.respondError(c, err)
 	}
 	return response.OK(c, nil)
+}
+
+func (h *Handler) ResendInvitation(c *fiber.Ctx) error {
+	if middleware.Role(c) != string(RoleOwner) {
+		return response.Err(c, fiber.StatusForbidden, "apenas o owner pode reenviar convites")
+	}
+
+	link, err := h.service.ResendInvitation(c.Context(), middleware.CompanyID(c), middleware.UserID(c), c.Params("id"))
+	if err != nil {
+		return h.respondError(c, err)
+	}
+
+	resp := &InviteResponse{}
+	if h.exposeInviteLinks {
+		resp.InviteLink = link
+	}
+	return response.OK(c, resp)
 }
 
 func (h *Handler) Deactivate(c *fiber.Ctx) error {

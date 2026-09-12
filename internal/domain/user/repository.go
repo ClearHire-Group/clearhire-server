@@ -34,6 +34,9 @@ type Repository interface {
 	CreateInvitation(ctx context.Context, inv *Invitation) error
 	FindPendingInvitationByEmail(ctx context.Context, companyID, email string) (*Invitation, error)
 	FindInvitationByTokenHash(ctx context.Context, tokenHash string) (*Invitation, error)
+	// FindInvitationByID é escopado por company — nunca deixa o resend/cancel de uma empresa
+	// enxergar convite de outra, mesmo sabendo o :id.
+	FindInvitationByID(ctx context.Context, id, companyID string) (*Invitation, error)
 	MarkInvitationAccepted(ctx context.Context, id string) error
 	// RevokeInvitation só afeta a linha se ainda estiver 'pending' — cancelar um convite já aceito
 	// não desfaz o usuário criado, e cancelar um já expirado/revogado não faz nada (RowsAffected
@@ -171,6 +174,11 @@ func (r *postgresRepository) FindPendingInvitationByEmail(ctx context.Context, c
 
 func (r *postgresRepository) FindInvitationByTokenHash(ctx context.Context, tokenHash string) (*Invitation, error) {
 	row := r.db.QueryRow(ctx, "select "+invitationColumns+" from user_invitations where token_hash = $1", tokenHash)
+	return scanInvitation(row)
+}
+
+func (r *postgresRepository) FindInvitationByID(ctx context.Context, id, companyID string) (*Invitation, error) {
+	row := r.db.QueryRow(ctx, "select "+invitationColumns+" from user_invitations where id = $1 and company_id = $2", id, companyID)
 	return scanInvitation(row)
 }
 

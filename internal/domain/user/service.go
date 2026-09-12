@@ -33,6 +33,11 @@ type Service interface {
 	// escopa a linha; cancelar um convite de outra empresa ou já aceito/expirado/revogado devolve
 	// NotFound, nunca afeta nada.
 	CancelInvitation(ctx context.Context, companyID, invitationID string) error
+	// ResendInvitation troca um convite pendente por um novo — o token antigo é revogado no mesmo
+	// golpe, nunca fica reutilizável em paralelo com o novo. Não existe "reexibir" o link original:
+	// só o hash do token fica no banco (mesma lógica de senha), então o único jeito de o owner ter
+	// um link funcionando de novo é gerar um convite novo.
+	ResendInvitation(ctx context.Context, companyID, invitedByUserID, invitationID string) (string, error)
 }
 
 type service struct {
@@ -98,7 +103,38 @@ func (s *service) Invite(ctx context.Context, companyID, invitedByUserID string,
 	if pending, err := s.repo.FindPendingInvitationByEmail(ctx, companyID, req.Email); err == nil && pending != nil {
 		return "", apperror.BadRequest("já existe um convite pendente para este e-mail")
 	}
+	return s.createInvitation(ctx, companyID, invitedByUserID, req.Email)
+}
 
+func (s *service) ResendInvitation(ctx context.Context, companyID, invitedByUserID, invitationID string) (string, error) {
+	inv, err := s.repo.FindInvitationByID(ctx, invitationID, companyID)
+	if err != nil {
+		return "", apperror.Internal("falha ao buscar convite")
+	}
+	if inv == nil || inv.Status != InvitationPending {
+		return "", apperror.NotFound("convite não encontrado ou já processado")
+	}
+
+	// Revoga o convite atual ANTES de criar o novo: um e-mail só pode ter um convite pending por
+	// vez (índice único parcial no banco — ver migrations/0001_init.sql), então criar o novo
+	// primeiro esbarraria nessa constraint com o antigo ainda pending.
+	matched, err := s.repo.RevokeInvitation(ctx, invitationID, companyID)
+	if err != nil {
+		return "", apperror.Internal("falha ao invalidar convite antigo")
+	}
+	if !matched {
+		// Corrida rara: o convite deixou de ser pending entre o FindInvitationByID acima e aqui
+		// (ex.: cancelado em outra aba no mesmo instante) — mesmo erro genérico de "já processado".
+		return "", apperror.NotFound("convite não encontrado ou já processado")
+	}
+
+	return s.createInvitation(ctx, companyID, invitedByUserID, inv.Email)
+}
+
+// createInvitation gera o token opaco, grava o convite pending e dispara o e-mail (melhor
+// esforço) — compartilhado por Invite (convite novo) e ResendInvitation (troca o convite pending
+// por um com token novo, já que o token antigo nunca pode ser reexibido — só o hash fica salvo).
+func (s *service) createInvitation(ctx context.Context, companyID, invitedByUserID, email string) (string, error) {
 	rawToken, hash, err := generateOpaqueToken()
 	if err != nil {
 		return "", apperror.Internal("falha ao gerar convite")
@@ -106,7 +142,7 @@ func (s *service) Invite(ctx context.Context, companyID, invitedByUserID string,
 
 	inv := &Invitation{
 		CompanyID:       companyID,
-		Email:           req.Email,
+		Email:           email,
 		InvitedByUserID: invitedByUserID,
 		TokenHash:       hash,
 		Status:          InvitationPending,
@@ -121,7 +157,7 @@ func (s *service) Invite(ctx context.Context, companyID, invitedByUserID string,
 	body := fmt.Sprintf("Você foi convidado a entrar como RH no Clearhire. Acesse o link para criar sua senha: %s", link)
 	// Melhor esforço: falha ao "enviar" o e-mail não desfaz o convite já criado — a pessoa
 	// convidada ainda pode receber o link por outro canal (ver InviteResponse.InviteLink em dev).
-	_ = s.mailer.Send(ctx, req.Email, subject, body)
+	_ = s.mailer.Send(ctx, email, subject, body)
 
 	return link, nil
 }
