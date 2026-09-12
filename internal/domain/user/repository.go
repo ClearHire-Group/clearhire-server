@@ -35,6 +35,11 @@ type Repository interface {
 	FindPendingInvitationByEmail(ctx context.Context, companyID, email string) (*Invitation, error)
 	FindInvitationByTokenHash(ctx context.Context, tokenHash string) (*Invitation, error)
 	MarkInvitationAccepted(ctx context.Context, id string) error
+	// RevokeInvitation só afeta a linha se ainda estiver 'pending' — cancelar um convite já aceito
+	// não desfaz o usuário criado, e cancelar um já expirado/revogado não faz nada (RowsAffected
+	// zero é o mesmo "já não tem o que cancelar" pro service). companyID escopa a linha: nunca
+	// cancela convite de outra empresa mesmo que o :id exista.
+	RevokeInvitation(ctx context.Context, id, companyID string) (bool, error)
 	ListPendingByCompany(ctx context.Context, companyID string) ([]Invitation, error)
 }
 
@@ -172,6 +177,18 @@ func (r *postgresRepository) FindInvitationByTokenHash(ctx context.Context, toke
 func (r *postgresRepository) MarkInvitationAccepted(ctx context.Context, id string) error {
 	_, err := r.db.Exec(ctx, "update user_invitations set status = 'accepted', accepted_at = now() where id = $1", id)
 	return err
+}
+
+func (r *postgresRepository) RevokeInvitation(ctx context.Context, id, companyID string) (bool, error) {
+	tag, err := r.db.Exec(ctx, `
+		update user_invitations
+		set status = 'revoked'
+		where id = $1 and company_id = $2 and status = 'pending'
+	`, id, companyID)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 func (r *postgresRepository) ListPendingByCompany(ctx context.Context, companyID string) ([]Invitation, error) {

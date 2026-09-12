@@ -28,6 +28,11 @@ type Service interface {
 	// owner autenticado antes de executar — o JWT sozinho não basta pra uma ação destrutiva sobre
 	// outra conta.
 	Deactivate(ctx context.Context, companyID, targetID, callerID, callerPassword string) error
+	// CancelInvitation revoga um convite ainda pendente — o link já enviado/exposto vira
+	// permanentemente inválido (AcceptInvitation recusa qualquer status != pending). companyID
+	// escopa a linha; cancelar um convite de outra empresa ou já aceito/expirado/revogado devolve
+	// NotFound, nunca afeta nada.
+	CancelInvitation(ctx context.Context, companyID, invitationID string) error
 }
 
 type service struct {
@@ -149,6 +154,17 @@ func (s *service) Deactivate(ctx context.Context, companyID, targetID, callerID,
 	// Melhor esforço: a desativação já aconteceu, uma falha aqui não deve virar erro pro caller.
 	_ = s.repo.RevokeSessions(ctx, targetID)
 
+	return nil
+}
+
+func (s *service) CancelInvitation(ctx context.Context, companyID, invitationID string) error {
+	matched, err := s.repo.RevokeInvitation(ctx, invitationID, companyID)
+	if err != nil {
+		return apperror.Internal("falha ao cancelar convite")
+	}
+	if !matched {
+		return apperror.NotFound("convite não encontrado ou já processado")
+	}
 	return nil
 }
 
