@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
+
 	"github.com/ClearHire-Group/clearhire-server/pkg/apperror"
 	"github.com/ClearHire-Group/clearhire-server/pkg/mailer"
 )
@@ -22,8 +24,10 @@ type Service interface {
 	// (development) ou fica só no e-mail enviado via mailer.Sender.
 	Invite(ctx context.Context, companyID, invitedByUserID string, req InviteUserRequest) (string, error)
 	// Deactivate nunca deixa callerID desativar a própria conta (companyID + targetID escopam
-	// a linha, callerID é só a checagem de "não é você mesmo").
-	Deactivate(ctx context.Context, companyID, targetID, callerID string) error
+	// a linha, callerID é só a checagem de "não é você mesmo"). callerPassword reprova a senha do
+	// owner autenticado antes de executar — o JWT sozinho não basta pra uma ação destrutiva sobre
+	// outra conta.
+	Deactivate(ctx context.Context, companyID, targetID, callerID, callerPassword string) error
 }
 
 type service struct {
@@ -117,10 +121,21 @@ func (s *service) Invite(ctx context.Context, companyID, invitedByUserID string,
 	return link, nil
 }
 
-func (s *service) Deactivate(ctx context.Context, companyID, targetID, callerID string) error {
+func (s *service) Deactivate(ctx context.Context, companyID, targetID, callerID, callerPassword string) error {
 	if targetID == callerID {
 		return apperror.BadRequest("não é possível desativar sua própria conta")
 	}
+
+	caller, err := s.repo.FindByID(ctx, callerID)
+	if err != nil {
+		return apperror.Internal("falha ao validar senha")
+	}
+	// Mesma mensagem tanto pra conta do caller sumida (não deveria acontecer com um JWT válido)
+	// quanto senha errada — não dar pista nenhuma sobre por que a confirmação falhou.
+	if caller == nil || bcrypt.CompareHashAndPassword([]byte(caller.PasswordHash), []byte(callerPassword)) != nil {
+		return apperror.Unauthorized("senha incorreta")
+	}
+
 	matched, err := s.repo.SetActive(ctx, targetID, companyID, false)
 	if err != nil {
 		return apperror.Internal("falha ao desativar usuário")
@@ -128,6 +143,12 @@ func (s *service) Deactivate(ctx context.Context, companyID, targetID, callerID 
 	if !matched {
 		return apperror.NotFound("usuário não encontrado")
 	}
+
+	// Corta o acesso na hora — sem isso o access token do assento removido (até 15min de vida)
+	// continua funcionando normalmente, já que middleware.Auth só confere assinatura/expiração.
+	// Melhor esforço: a desativação já aconteceu, uma falha aqui não deve virar erro pro caller.
+	_ = s.repo.RevokeSessions(ctx, targetID)
+
 	return nil
 }
 

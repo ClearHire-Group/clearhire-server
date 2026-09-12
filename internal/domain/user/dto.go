@@ -12,6 +12,13 @@ type UpdateMeRequest struct {
 	Name string `json:"name" validate:"required"`
 }
 
+// DeactivateRequest é o payload de DELETE /users/:id — desativar um assento é destrutivo o
+// bastante (a pessoa perde acesso na hora) pra exigir que o owner reprove a própria senha, não só
+// o JWT já em mãos. Password é a senha do CALLER (owner autenticado), nunca do alvo.
+type DeactivateRequest struct {
+	Password string `json:"password" validate:"required"`
+}
+
 // MeResponse é o que GET/PATCH /users/me devolvem.
 type MeResponse struct {
 	ID    string `json:"id"`

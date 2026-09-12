@@ -24,6 +24,12 @@ type Repository interface {
 	SetActive(ctx context.Context, id, companyID string, active bool) (bool, error)
 	UpdateName(ctx context.Context, id, companyID, name string) (bool, error)
 	UpdatePasswordHash(ctx context.Context, id, passwordHash string) error
+	// RevokeSessions mata os refresh tokens ativos do usuário — chamado ao desativar um assento,
+	// pra cortar o acesso na hora em vez de esperar o access token (até 15min) expirar sozinho.
+	// Duplicado de auth.Repository.RevokeAllForUser de propósito: auth já importa user (login,
+	// convite), então user não pode importar auth de volta (ciclo) — mesmo motivo de
+	// generateOpaqueToken estar duplicado entre os dois pacotes.
+	RevokeSessions(ctx context.Context, userID string) error
 
 	CreateInvitation(ctx context.Context, inv *Invitation) error
 	FindPendingInvitationByEmail(ctx context.Context, companyID, email string) (*Invitation, error)
@@ -118,6 +124,11 @@ func (r *postgresRepository) UpdateName(ctx context.Context, id, companyID, name
 
 func (r *postgresRepository) UpdatePasswordHash(ctx context.Context, id, passwordHash string) error {
 	_, err := r.db.Exec(ctx, "update users set password_hash = $2 where id = $1", id, passwordHash)
+	return err
+}
+
+func (r *postgresRepository) RevokeSessions(ctx context.Context, userID string) error {
+	_, err := r.db.Exec(ctx, "update refresh_tokens set revoked_at = now() where user_id = $1 and revoked_at is null", userID)
 	return err
 }
 

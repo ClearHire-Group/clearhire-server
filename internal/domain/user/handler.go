@@ -2,6 +2,7 @@ package user
 
 import (
 	"errors"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 
@@ -29,7 +30,10 @@ func (h *Handler) RegisterRoutes(router fiber.Router) {
 	group.Get("/me", h.Me)
 	group.Patch("/me", h.UpdateMe)
 	group.Post("/invitations", h.Invite)
-	group.Delete("/:id", h.Deactivate)
+	// Rate limit aqui de propósito: a partir desta mudança o endpoint aceita uma senha no corpo
+	// (ver DeactivateRequest) — sem limite, seria um oráculo de força bruta contra a senha do
+	// próprio owner escondido atrás de uma rota autenticada. Mesmo padrão de POST /auth/login.
+	group.Delete("/:id", middleware.RateLimit(5, time.Minute), h.Deactivate)
 }
 
 func (h *Handler) Me(c *fiber.Ctx) error {
@@ -102,7 +106,15 @@ func (h *Handler) Deactivate(c *fiber.Ctx) error {
 		return response.Err(c, fiber.StatusForbidden, "apenas o owner pode desativar assentos")
 	}
 
-	err := h.service.Deactivate(c.Context(), middleware.CompanyID(c), c.Params("id"), middleware.UserID(c))
+	var req DeactivateRequest
+	if err := c.BodyParser(&req); err != nil {
+		return response.Err(c, fiber.StatusBadRequest, "payload inválido")
+	}
+	if err := validator.Validate(req); err != nil {
+		return response.Err(c, fiber.StatusBadRequest, "senha é obrigatória")
+	}
+
+	err := h.service.Deactivate(c.Context(), middleware.CompanyID(c), c.Params("id"), middleware.UserID(c), req.Password)
 	if err != nil {
 		return h.respondError(c, err)
 	}
