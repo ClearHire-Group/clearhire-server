@@ -3,10 +3,10 @@ package company
 // RegisterCompanyRequest é o payload de POST /companies — o cadastro inicial
 // da empresa junto com o primeiro RH (owner).
 type RegisterCompanyRequest struct {
-	CompanyName  string `json:"companyName" validate:"required"`
-	OwnerName    string `json:"ownerName" validate:"required"`
-	OwnerEmail   string `json:"ownerEmail" validate:"required,email"`
-	OwnerPassword string `json:"ownerPassword" validate:"required,min=8"`
+	CompanyName   string `json:"companyName" validate:"required,max=200"`
+	OwnerName     string `json:"ownerName" validate:"required,max=200"`
+	OwnerEmail    string `json:"ownerEmail" validate:"required,email,max=254"`
+	OwnerPassword string `json:"ownerPassword" validate:"required,min=8,max=72"`
 }
 
 // UpdateCultureProfileRequest é o payload de POST /company-profile — tela de

@@ -7,6 +7,7 @@ import (
 
 	"github.com/ClearHire-Group/clearhire-server/internal/middleware"
 	"github.com/ClearHire-Group/clearhire-server/pkg/apperror"
+	"github.com/ClearHire-Group/clearhire-server/pkg/idparam"
 	"github.com/ClearHire-Group/clearhire-server/pkg/response"
 	"github.com/ClearHire-Group/clearhire-server/pkg/validator"
 )
@@ -25,6 +26,13 @@ func (h *Handler) RegisterRoutes(router fiber.Router) {
 	group.Post("/", h.Create)
 	group.Get("/:id", h.Get)
 	group.Post("/:id/toggle-pause", h.TogglePause)
+	group.Post("/:id/public-application-link", h.SetPublicLink)
+}
+
+// RegisterPublicRoutes pluga a única leitura sem tenant deste domínio — GET /public/campaigns/:id,
+// chamada pelo candidato anônimo antes de se candidatar. Mesmo padrão de company.Handler.RegisterPublicRoutes.
+func (h *Handler) RegisterPublicRoutes(router fiber.Router) {
+	router.Group("/public/campaigns").Get("/:id", h.GetPublicInfo)
 }
 
 // RegisterReportsRoutes pluga os agregados que a tela Relatórios consome — moram aqui porque
@@ -65,7 +73,11 @@ func (h *Handler) Create(c *fiber.Ctx) error {
 }
 
 func (h *Handler) Get(c *fiber.Ctx) error {
-	view, err := h.service.Get(c.Context(), middleware.CompanyID(c), c.Params("id"))
+	id, ok := idparam.Valid(c, "id")
+	if !ok {
+		return nil
+	}
+	view, err := h.service.Get(c.Context(), middleware.CompanyID(c), id)
 	if err != nil {
 		return h.respondError(c, err)
 	}
@@ -73,11 +85,44 @@ func (h *Handler) Get(c *fiber.Ctx) error {
 }
 
 func (h *Handler) TogglePause(c *fiber.Ctx) error {
-	view, err := h.service.TogglePause(c.Context(), middleware.CompanyID(c), c.Params("id"))
+	id, ok := idparam.Valid(c, "id")
+	if !ok {
+		return nil
+	}
+	view, err := h.service.TogglePause(c.Context(), middleware.CompanyID(c), id)
 	if err != nil {
 		return h.respondError(c, err)
 	}
 	return response.OK(c, toResponse(view))
+}
+
+func (h *Handler) SetPublicLink(c *fiber.Ctx) error {
+	id, ok := idparam.Valid(c, "id")
+	if !ok {
+		return nil
+	}
+	var req SetPublicLinkRequest
+	if err := c.BodyParser(&req); err != nil {
+		return response.Err(c, fiber.StatusBadRequest, "payload inválido")
+	}
+
+	view, err := h.service.SetPublicApplicationsEnabled(c.Context(), middleware.CompanyID(c), id, req.Enabled)
+	if err != nil {
+		return h.respondError(c, err)
+	}
+	return response.OK(c, toResponse(view))
+}
+
+func (h *Handler) GetPublicInfo(c *fiber.Ctx) error {
+	id, ok := idparam.Valid(c, "id")
+	if !ok {
+		return nil
+	}
+	info, err := h.service.GetPublicInfo(c.Context(), id)
+	if err != nil {
+		return h.respondError(c, err)
+	}
+	return response.OK(c, toPublicInfoResponse(info))
 }
 
 func (h *Handler) FunnelSummary(c *fiber.Ctx) error {

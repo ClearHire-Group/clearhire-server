@@ -46,9 +46,12 @@ func (h *Handler) RegisterRoutes(router fiber.Router) {
 	group.Post("/login", middleware.RateLimit(10, time.Minute), h.Login)
 	group.Post("/refresh", h.Refresh)
 	group.Post("/logout", h.Logout)
-	group.Post("/invitations/:token/accept", h.AcceptInvitation)
+	// O token em si (32 bytes aleatórios, só o hash fica no banco) não é adivinhável por força
+	// bruta em nenhum ritmo de rate limit — o limite aqui é defesa em profundidade contra abuso/
+	// spam de requisições nessas rotas públicas, mesmo padrão de login/password-reset abaixo.
+	group.Post("/invitations/:token/accept", middleware.RateLimit(10, time.Minute), h.AcceptInvitation)
 	group.Post("/password-reset", middleware.RateLimit(5, time.Minute), h.RequestPasswordReset)
-	group.Post("/password-reset/:token", h.ConfirmPasswordReset)
+	group.Post("/password-reset/:token", middleware.RateLimit(10, time.Minute), h.ConfirmPasswordReset)
 }
 
 func (h *Handler) Login(c *fiber.Ctx) error {

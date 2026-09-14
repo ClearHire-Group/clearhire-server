@@ -11,11 +11,13 @@ import (
 )
 
 type Config struct {
-	Env         string
-	Port        string
-	DatabaseURL string
-	JWTSecret   string
-	CORSOrigin  string
+	Env             string
+	Port            string
+	DatabaseURL     string
+	JWTSecret       string
+	CORSOrigin      string
+	AnthropicAPIKey string
+	AnthropicModel  string
 }
 
 const minJWTSecretLen = 32
@@ -33,6 +35,10 @@ func Load() (*Config, error) {
 		DatabaseURL: getEnv("DATABASE_URL", ""),
 		JWTSecret:   getEnv("JWT_SECRET", ""),
 		CORSOrigin:  getEnv("CORS_ORIGIN", "http://localhost:4200"),
+		// Vazia é aceitável — só o modo currículo da candidatura pública fica indisponível (erro
+		// claro, "tente o formulário manual"); nada mais no servidor depende disto pra subir.
+		AnthropicAPIKey: getEnv("ANTHROPIC_API_KEY", ""),
+		AnthropicModel:  getEnv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
 	}
 
 	if err := cfg.validateJWTSecret(); err != nil {

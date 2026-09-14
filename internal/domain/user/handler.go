@@ -8,6 +8,7 @@ import (
 
 	"github.com/ClearHire-Group/clearhire-server/internal/middleware"
 	"github.com/ClearHire-Group/clearhire-server/pkg/apperror"
+	"github.com/ClearHire-Group/clearhire-server/pkg/idparam"
 	"github.com/ClearHire-Group/clearhire-server/pkg/response"
 	"github.com/ClearHire-Group/clearhire-server/pkg/validator"
 )
@@ -29,12 +30,15 @@ func (h *Handler) RegisterRoutes(router fiber.Router) {
 	group.Get("/", h.ListTeam)
 	group.Get("/me", h.Me)
 	group.Patch("/me", h.UpdateMe)
-	group.Post("/invitations", h.Invite)
+	// Rate limit aqui: convidar e reenviar disparam e-mail pra um terceiro (uma vez que o mailer
+	// real estiver ligado) — sem limite, uma sessão de owner comprometida vira ferramenta de
+	// spam/email-bombing contra qualquer endereço.
+	group.Post("/invitations", middleware.RateLimit(10, time.Minute), h.Invite)
 	// Rota de convite específica ANTES de "/:id": tem um segmento a mais ("/invitations/:id"), não
 	// colide de verdade com "/:id" (que só casa um segmento), mas mantém as duas rotas de convite
 	// juntas facilita ler.
 	group.Delete("/invitations/:id", h.CancelInvitation)
-	group.Post("/invitations/:id/resend", h.ResendInvitation)
+	group.Post("/invitations/:id/resend", middleware.RateLimit(10, time.Minute), h.ResendInvitation)
 	// Rate limit aqui de propósito: a partir desta mudança o endpoint aceita uma senha no corpo
 	// (ver DeactivateRequest) — sem limite, seria um oráculo de força bruta contra a senha do
 	// próprio owner escondido atrás de uma rota autenticada. Mesmo padrão de POST /auth/login.
@@ -110,8 +114,12 @@ func (h *Handler) CancelInvitation(c *fiber.Ctx) error {
 	if middleware.Role(c) != string(RoleOwner) {
 		return response.Err(c, fiber.StatusForbidden, "apenas o owner pode cancelar convites")
 	}
+	id, ok := idparam.Valid(c, "id")
+	if !ok {
+		return nil
+	}
 
-	if err := h.service.CancelInvitation(c.Context(), middleware.CompanyID(c), c.Params("id")); err != nil {
+	if err := h.service.CancelInvitation(c.Context(), middleware.CompanyID(c), id); err != nil {
 		return h.respondError(c, err)
 	}
 	return response.OK(c, nil)
@@ -121,8 +129,12 @@ func (h *Handler) ResendInvitation(c *fiber.Ctx) error {
 	if middleware.Role(c) != string(RoleOwner) {
 		return response.Err(c, fiber.StatusForbidden, "apenas o owner pode reenviar convites")
 	}
+	id, ok := idparam.Valid(c, "id")
+	if !ok {
+		return nil
+	}
 
-	link, err := h.service.ResendInvitation(c.Context(), middleware.CompanyID(c), middleware.UserID(c), c.Params("id"))
+	link, err := h.service.ResendInvitation(c.Context(), middleware.CompanyID(c), middleware.UserID(c), id)
 	if err != nil {
 		return h.respondError(c, err)
 	}
@@ -138,6 +150,10 @@ func (h *Handler) Deactivate(c *fiber.Ctx) error {
 	if middleware.Role(c) != string(RoleOwner) {
 		return response.Err(c, fiber.StatusForbidden, "apenas o owner pode desativar assentos")
 	}
+	id, ok := idparam.Valid(c, "id")
+	if !ok {
+		return nil
+	}
 
 	var req DeactivateRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -147,7 +163,7 @@ func (h *Handler) Deactivate(c *fiber.Ctx) error {
 		return response.Err(c, fiber.StatusBadRequest, "senha é obrigatória")
 	}
 
-	err := h.service.Deactivate(c.Context(), middleware.CompanyID(c), c.Params("id"), middleware.UserID(c), req.Password)
+	err := h.service.Deactivate(c.Context(), middleware.CompanyID(c), id, middleware.UserID(c), req.Password)
 	if err != nil {
 		return h.respondError(c, err)
 	}

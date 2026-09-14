@@ -3,20 +3,21 @@ package user
 // InviteUserRequest é o payload de POST /users/invitations — o owner
 // convida o segundo assento de RH pelo e-mail.
 type InviteUserRequest struct {
-	Email string `json:"email" validate:"required,email"`
+	Email string `json:"email" validate:"required,email,max=254"`
 }
 
 // UpdateMeRequest é o payload de PATCH /users/me — cada RH só edita o
 // próprio nome, nunca o de outro (sem :id de rota, id vem do token).
 type UpdateMeRequest struct {
-	Name string `json:"name" validate:"required"`
+	Name string `json:"name" validate:"required,max=200"`
 }
 
 // DeactivateRequest é o payload de DELETE /users/:id — desativar um assento é destrutivo o
 // bastante (a pessoa perde acesso na hora) pra exigir que o owner reprove a própria senha, não só
-// o JWT já em mãos. Password é a senha do CALLER (owner autenticado), nunca do alvo.
+// o JWT já em mãos. Password é a senha do CALLER (owner autenticado), nunca do alvo. max=72 pelo
+// mesmo motivo de auth.LoginRequest — é o limite real que o bcrypt usa.
 type DeactivateRequest struct {
-	Password string `json:"password" validate:"required"`
+	Password string `json:"password" validate:"required,max=72"`
 }
 
 // MeResponse é o que GET/PATCH /users/me devolvem.

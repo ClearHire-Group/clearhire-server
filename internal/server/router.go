@@ -16,6 +16,9 @@ func RegisterRoutes(app *fiber.App, f *factory.Factory, cfg *config.Config) {
 
 	f.AuthHandler.RegisterRoutes(v1)
 	f.CompanyHandler.RegisterPublicRoutes(v1)
+	// Candidatura pública por link de campanha — candidato anônimo, sem JWT nenhum.
+	f.CampaignHandler.RegisterPublicRoutes(v1)
+	f.CandidateHandler.RegisterPublicRoutes(v1)
 
 	protected := v1.Group("", middleware.Auth(cfg.JWTSecret), middleware.Tenant())
 	f.CompanyHandler.RegisterProfileRoutes(protected)
@@ -23,5 +26,6 @@ func RegisterRoutes(app *fiber.App, f *factory.Factory, cfg *config.Config) {
 	f.CampaignHandler.RegisterRoutes(protected)
 	f.CampaignHandler.RegisterReportsRoutes(protected)
 	f.CandidateHandler.RegisterRoutes(protected)
+	f.CandidateHandler.RegisterCampaignRoutes(protected)
 	f.TalentHandler.RegisterRoutes(protected)
 }

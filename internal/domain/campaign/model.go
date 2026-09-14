@@ -34,11 +34,28 @@ type Campaign struct {
 	ContractType    string
 	Seniority       string
 	Status          Status
-	OpenedAt        time.Time
-	PausedAt        *time.Time
-	ClosedAt        *time.Time
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
+	// AcceptsPublicApplications é independente de Status — pausar/encerrar a campanha já derruba
+	// o link (a query pública sempre checa as duas colunas juntas), mas o recrutador também pode
+	// ligar/desligar só o link de candidatura sem mexer no status da campanha em si.
+	AcceptsPublicApplications bool
+	OpenedAt                  time.Time
+	PausedAt                  *time.Time
+	ClosedAt                  *time.Time
+	CreatedAt                 time.Time
+	UpdatedAt                 time.Time
+}
+
+// PublicInfo é o subconjunto seguro de Campaign pra exibir num link público — nunca
+// CreatedByUserID, contagem de candidatos ou qualquer coisa interna. Ver campaign.Repository.FindPublicByID.
+type PublicInfo struct {
+	ID           string
+	Title        string
+	CompanyName  string
+	City         string
+	State        string
+	Modality     string
+	ContractType string
+	Seniority    string
 }
 
 // Phase é um módulo do funil configurado pra essa campanha (campaign_phases).

@@ -15,6 +15,15 @@ type Repository interface {
 	ListByCompany(ctx context.Context, companyID string) ([]Campaign, error)
 	Create(ctx context.Context, c *Campaign, phases []Phase) error
 	SetStatus(ctx context.Context, companyID, id string, status Status, pausedAt *time.Time) error
+	// SetPublicApplicationsEnabled liga/desliga o link de candidatura pública — estado desejado
+	// explícito (não um toggle cego), porque "gerar link" e "desativar link" são duas ações
+	// distintas e idempotentes do recrutador, não uma alternância simétrica.
+	SetPublicApplicationsEnabled(ctx context.Context, companyID, id string, enabled bool) error
+	// FindPublicByID NÃO recebe companyID — quem chama é anônimo, sem tenant nenhum. A própria
+	// query faz a checagem de elegibilidade (status ativa + link ligado + não deletada); nil, nil
+	// cobre "não existe" e "existe mas não está elegível" com o mesmo resultado, de propósito —
+	// nunca dar pista de qual dos dois é o caso pra quem chama de fora.
+	FindPublicByID(ctx context.Context, id string) (*PublicInfo, error)
 	// PhaseCountsByCampaign/PhaseCountsByCompany devolvem a contagem CUMULATIVA por fase —
 	// candidatos cuja fase atual está nesta posição do funil ou adiante, nunca uma contagem
 	// exata "quem está sentado aqui agora". Ver PhaseCount no model.go pro porquê.
@@ -34,13 +43,13 @@ func NewRepository(db database.DB) Repository {
 }
 
 const campaignColumns = `id, company_id, created_by_user_id, title, coalesce(city, ''), coalesce(state, ''),
-	modality, contract_type, seniority, status, opened_at, paused_at, closed_at, created_at, updated_at`
+	modality, contract_type, seniority, status, accepts_public_applications, opened_at, paused_at, closed_at, created_at, updated_at`
 
 func scanCampaign(row pgx.Row) (*Campaign, error) {
 	var c Campaign
 	err := row.Scan(
 		&c.ID, &c.CompanyID, &c.CreatedByUserID, &c.Title, &c.City, &c.State,
-		&c.Modality, &c.ContractType, &c.Seniority, &c.Status, &c.OpenedAt, &c.PausedAt, &c.ClosedAt,
+		&c.Modality, &c.ContractType, &c.Seniority, &c.Status, &c.AcceptsPublicApplications, &c.OpenedAt, &c.PausedAt, &c.ClosedAt,
 		&c.CreatedAt, &c.UpdatedAt,
 	)
 	if err != nil {
@@ -109,6 +118,34 @@ func (r *postgresRepository) SetStatus(ctx context.Context, companyID, id string
 		where id = $1 and company_id = $2 and deleted_at is null
 	`, id, companyID, status, pausedAt)
 	return err
+}
+
+func (r *postgresRepository) SetPublicApplicationsEnabled(ctx context.Context, companyID, id string, enabled bool) error {
+	_, err := r.db.Exec(ctx, `
+		update campaigns set accepts_public_applications = $3
+		where id = $1 and company_id = $2 and deleted_at is null
+	`, id, companyID, enabled)
+	return err
+}
+
+func (r *postgresRepository) FindPublicByID(ctx context.Context, id string) (*PublicInfo, error) {
+	row := r.db.QueryRow(ctx, `
+		select c.id, c.title, co.name, coalesce(c.city, ''), coalesce(c.state, ''),
+		       c.modality, c.contract_type, c.seniority
+		from campaigns c
+		join companies co on co.id = c.company_id
+		where c.id = $1 and c.status = 'ativa' and c.accepts_public_applications and c.deleted_at is null
+	`, id)
+	var info PublicInfo
+	err := row.Scan(&info.ID, &info.Title, &info.CompanyName, &info.City, &info.State,
+		&info.Modality, &info.ContractType, &info.Seniority)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &info, nil
 }
 
 // PhaseCountsByCampaign/PhaseCountsByCompany compartilham a mesma forma de query: um self-join

@@ -44,6 +44,10 @@ type Repository interface {
 	CreatePasswordResetToken(ctx context.Context, userID, tokenHash string, expiresAt time.Time) error
 	FindPasswordResetTokenByHash(ctx context.Context, tokenHash string) (*PasswordResetToken, error)
 	MarkPasswordResetTokenUsed(ctx context.Context, id string) error
+	// InvalidatePendingPasswordResetTokens marca como usado qualquer token de reset ainda não
+	// usado do usuário — chamado antes de emitir um token novo, pra um link antigo (ainda dentro
+	// da validade de 1h) nunca ficar utilizável em paralelo com o mais recente.
+	InvalidatePendingPasswordResetTokens(ctx context.Context, userID string) error
 }
 
 type postgresRepository struct {
@@ -114,5 +118,10 @@ func (r *postgresRepository) FindPasswordResetTokenByHash(ctx context.Context, t
 
 func (r *postgresRepository) MarkPasswordResetTokenUsed(ctx context.Context, id string) error {
 	_, err := r.db.Exec(ctx, "update password_reset_tokens set used_at = now() where id = $1", id)
+	return err
+}
+
+func (r *postgresRepository) InvalidatePendingPasswordResetTokens(ctx context.Context, userID string) error {
+	_, err := r.db.Exec(ctx, "update password_reset_tokens set used_at = now() where user_id = $1 and used_at is null", userID)
 	return err
 }

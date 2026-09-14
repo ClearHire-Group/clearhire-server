@@ -23,6 +23,11 @@ const (
 	refreshTokenTTL       = 30 * 24 * time.Hour
 	passwordResetTTL      = time.Hour
 	seatLimitCheckErrCode = "23514" // check_violation — trigger trg_users_seat_limit no banco
+	// uniqueViolationErrCode dispara quando o e-mail do convite já pertence a uma conta de OUTRA
+	// empresa (users.email é unique globalmente) — caso legítimo desde que user.Service.Invite
+	// parou de recusar isso na hora do convite pra não vazar existência de conta entre empresas
+	// (ver comentário lá). Aqui na aceitação é onde isso realmente se resolve.
+	uniqueViolationErrCode = "23505"
 )
 
 // Service concentra a lógica de autenticação — verificação de senha, emissão
@@ -76,14 +81,37 @@ func (s *service) Login(ctx context.Context, req LoginRequest) (*TokenPair, erro
 	// Mesma mensagem de erro pra "não existe" e "senha errada" — não dar
 	// pista de qual e-mail está cadastrado.
 	invalid := apperror.Unauthorized("e-mail ou senha inválidos")
-	if u == nil || !u.IsActive {
-		return nil, invalid
+
+	// bcrypt.CompareHashAndPassword roda SEMPRE, mesmo pra e-mail inexistente/inativo — contra um
+	// hash dummy fixo nesse caso. Sem isso, só a conta que existe de verdade pagava o custo do
+	// bcrypt (~150-200ms), e essa diferença de tempo é um oráculo limpo de enumeração de e-mail
+	// (achado num pentest: e-mail inexistente respondia em ~3ms, e-mail real+senha errada em
+	// ~177ms — a mensagem de erro era idêntica, mas o timing já entregava a resposta).
+	hash := dummyPasswordHash
+	found := u != nil && u.IsActive
+	if found {
+		hash = u.PasswordHash
 	}
-	if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(req.Password)); err != nil {
+	pwErr := bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password))
+	if !found || pwErr != nil {
 		return nil, invalid
 	}
 
 	return s.issueSession(ctx, u.ID, u.CompanyID, string(u.Role))
+}
+
+// dummyPasswordHash é comparado no lugar do hash real quando o e-mail não corresponde a uma conta
+// ativa — gerado uma vez no boot (custo pago uma única vez), nunca corresponde a nenhuma senha de
+// verdade, só existe pra o bcrypt.CompareHashAndPassword ter o mesmo custo em qualquer branch de
+// Login.
+var dummyPasswordHash = mustHashDummyPassword()
+
+func mustHashDummyPassword() string {
+	hash, err := bcrypt.GenerateFromPassword([]byte("nunca-corresponde-a-senha-nenhuma"), bcrypt.DefaultCost)
+	if err != nil {
+		panic(err)
+	}
+	return string(hash)
 }
 
 func (s *service) Refresh(ctx context.Context, rawToken string) (*TokenPair, error) {
@@ -174,8 +202,17 @@ func (s *service) AcceptInvitation(ctx context.Context, invitationToken string, 
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == seatLimitCheckErrCode {
-			return "", apperror.BadRequest("a empresa já atingiu o limite de assentos de RH")
+		if errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case seatLimitCheckErrCode:
+				return "", apperror.BadRequest("a empresa já atingiu o limite de assentos de RH")
+			case uniqueViolationErrCode:
+				// E-mail já pertence a uma conta de outra empresa — mesma mensagem genérica de
+				// convite inválido usada acima, nunca "este e-mail já tem conta em outro lugar":
+				// quem está tentando aceitar não tem por que saber disso, e o owner que mandou o
+				// convite também não descobriu nada na hora de criar (ver user.Service.Invite).
+				return "", invalid
+			}
 		}
 		return "", apperror.Internal("falha ao aceitar convite")
 	}
@@ -191,6 +228,15 @@ func (s *service) RequestPasswordReset(ctx context.Context, email string) (strin
 	// E-mail inexistente/inativo: sucesso silencioso, sem link — nunca revela se a conta existe.
 	if u == nil || !u.IsActive {
 		return "", nil
+	}
+
+	// Invalida qualquer link de reset anterior ainda não usado antes de emitir o novo — sem isso,
+	// um link antigo (dentro da 1h de validade) continuava funcionando em paralelo com o mais
+	// recente: quem pedisse reset duas vezes e usasse o link mais velho por engano (ou um
+	// atacante que tivesse interceptado um e-mail antigo) conseguia trocar a senha de novo depois,
+	// desfazendo silenciosamente a troca que o dono da conta já tinha feito.
+	if err := s.repo.InvalidatePendingPasswordResetTokens(ctx, u.ID); err != nil {
+		return "", apperror.Internal("falha ao gerar link de redefinição")
 	}
 
 	rawToken, hash, err := generateOpaqueToken()

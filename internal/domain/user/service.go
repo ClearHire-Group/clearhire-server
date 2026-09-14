@@ -97,11 +97,18 @@ func (s *service) ListTeam(ctx context.Context, companyID string) ([]TeamMember,
 }
 
 func (s *service) Invite(ctx context.Context, companyID, invitedByUserID string, req InviteUserRequest) (string, error) {
-	if existing, err := s.repo.FindByEmail(ctx, req.Email); err == nil && existing != nil {
-		return "", apperror.BadRequest("já existe uma conta com este e-mail")
-	}
 	if pending, err := s.repo.FindPendingInvitationByEmail(ctx, companyID, req.Email); err == nil && pending != nil {
 		return "", apperror.BadRequest("já existe um convite pendente para este e-mail")
+	}
+	// Só avisa "já existe conta" quando é alguém da PRÓPRIA empresa do owner — isso ele já tem
+	// direito de saber. Se o e-mail pertencer a uma conta de OUTRA empresa, segue como se fosse
+	// criar o convite normalmente, sem revelar nada (achado num pentest: essa checagem era global,
+	// virando um oráculo pra descobrir se um e-mail qualquer tem conta em algum lugar da
+	// plataforma). O convite criado nesse caso nunca vai poder ser aceito de verdade — users.email
+	// é unique globalmente (ver migrations/0001_init.sql) — e AcceptInvitation trata isso com a
+	// mesma mensagem genérica de convite inválido, sem expor o motivo real.
+	if existing, err := s.repo.FindByEmail(ctx, req.Email); err == nil && existing != nil && existing.CompanyID == companyID {
+		return "", apperror.BadRequest("esta pessoa já faz parte da sua equipe")
 	}
 	return s.createInvitation(ctx, companyID, invitedByUserID, req.Email)
 }

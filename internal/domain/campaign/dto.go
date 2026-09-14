@@ -11,9 +11,9 @@ import (
 // o usuário organizou no step 3 — Recebidos e Selecionados são sempre implícitos, o service quem
 // monta a lista completa. Lista vazia é um funil válido (mínimo: só Recebidos + Selecionados).
 type CreateCampaignRequest struct {
-	Title        string   `json:"title" validate:"required"`
-	City         string   `json:"city"`
-	State        string   `json:"state"`
+	Title        string   `json:"title" validate:"required,max=200"`
+	City         string   `json:"city" validate:"omitempty,max=100"`
+	State        string   `json:"state" validate:"omitempty,max=100"`
 	Modality     string   `json:"modality" validate:"required,oneof=remoto hibrido presencial"`
 	ContractType string   `json:"contractType" validate:"required,oneof=clt pj estagio"`
 	Seniority    string   `json:"seniority" validate:"required,oneof=junior pleno senior"`
@@ -31,16 +31,17 @@ type PhaseResponse struct {
 // Response espelha Campaign do frontend byte a byte — nunca devolver o model cru (sem json
 // tags, vazaria PascalCase; mesmo bug já corrigido uma vez neste repo, ver company/dto.go).
 type Response struct {
-	ID                string          `json:"id"`
-	Title             string          `json:"title"`
-	Status            string          `json:"status"`
-	Location          string          `json:"location"`
-	Meta              string          `json:"meta"`
-	TotalCandidates   int             `json:"totalCandidates"`
-	CurrentPhaseLabel string          `json:"currentPhaseLabel"`
-	CurrentPhaseKey   string          `json:"currentPhaseKey"`
-	FunnelPercent     int             `json:"funnelPercent"`
-	Phases            []PhaseResponse `json:"phases"`
+	ID                        string          `json:"id"`
+	Title                     string          `json:"title"`
+	Status                    string          `json:"status"`
+	Location                  string          `json:"location"`
+	Meta                      string          `json:"meta"`
+	TotalCandidates           int             `json:"totalCandidates"`
+	CurrentPhaseLabel         string          `json:"currentPhaseLabel"`
+	CurrentPhaseKey           string          `json:"currentPhaseKey"`
+	FunnelPercent             int             `json:"funnelPercent"`
+	Phases                    []PhaseResponse `json:"phases"`
+	AcceptsPublicApplications bool            `json:"acceptsPublicApplications"`
 }
 
 func toResponse(v *CampaignView) *Response {
@@ -49,16 +50,49 @@ func toResponse(v *CampaignView) *Response {
 		phases[i] = PhaseResponse{Key: pc.Key, Num: i + 1, Label: phaseLabels[pc.Key], Count: pc.Count}
 	}
 	return &Response{
-		ID:                v.ID,
-		Title:             v.Title,
-		Status:            string(v.Status),
-		Location:          buildLocation(v.Campaign),
-		Meta:              buildMeta(*v),
-		TotalCandidates:   v.TotalCandidates,
-		CurrentPhaseLabel: phaseLabels[v.CurrentPhaseKey],
-		CurrentPhaseKey:   v.CurrentPhaseKey,
-		FunnelPercent:     v.FunnelPercent,
-		Phases:            phases,
+		ID:                        v.ID,
+		Title:                     v.Title,
+		Status:                    string(v.Status),
+		Location:                  buildLocation(v.Campaign),
+		Meta:                      buildMeta(*v),
+		TotalCandidates:           v.TotalCandidates,
+		CurrentPhaseLabel:         phaseLabels[v.CurrentPhaseKey],
+		CurrentPhaseKey:           v.CurrentPhaseKey,
+		FunnelPercent:             v.FunnelPercent,
+		Phases:                    phases,
+		AcceptsPublicApplications: v.AcceptsPublicApplications,
+	}
+}
+
+// SetPublicLinkRequest é o payload de POST /campaigns/:id/public-application-link — estado
+// desejado explícito ({enabled: true|false}), não um toggle cego.
+type SetPublicLinkRequest struct {
+	Enabled bool `json:"enabled"`
+}
+
+// PublicInfoResponse é o que GET /public/campaigns/:id devolve pro candidato anônimo — só o
+// necessário pra mostrar a vaga, nunca nada interno (ver PublicInfo no model.go).
+type PublicInfoResponse struct {
+	ID           string `json:"id"`
+	Title        string `json:"title"`
+	CompanyName  string `json:"companyName"`
+	Location     string `json:"location"`
+	Modality     string `json:"modality"`
+	ContractType string `json:"contractType"`
+	Seniority    string `json:"seniority"`
+}
+
+func toPublicInfoResponse(v *PublicInfo) *PublicInfoResponse {
+	return &PublicInfoResponse{
+		ID:          v.ID,
+		Title:       v.Title,
+		CompanyName: v.CompanyName,
+		Location: buildLocation(Campaign{
+			City: v.City, State: v.State, Modality: v.Modality, ContractType: v.ContractType,
+		}),
+		Modality:     modalityLabels[v.Modality],
+		ContractType: contractTypeLabels[v.ContractType],
+		Seniority:    seniorityLabels[v.Seniority],
 	}
 }
 
@@ -109,6 +143,12 @@ var contractTypeLabels = map[string]string{
 	"clt":     "CLT",
 	"pj":      "PJ",
 	"estagio": "Estágio",
+}
+
+var seniorityLabels = map[string]string{
+	"junior": "Júnior",
+	"pleno":  "Pleno",
+	"senior": "Sênior",
 }
 
 // buildLocation monta "{cidade}, {estado} · {modalidade} · {tipo de contrato}", omitindo o

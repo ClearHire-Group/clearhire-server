@@ -2,10 +2,14 @@ package auth
 
 import "time"
 
-// LoginRequest é o payload de POST /auth/login.
+// LoginRequest é o payload de POST /auth/login. Password tem `max=72` porque é o limite real do
+// bcrypt — ele só deriva entropia dos 72 primeiros bytes da senha; qualquer coisa além disso não
+// soma segurança nenhuma, só aceita payload maior à toa (mesmo limite em todo campo de senha do
+// sistema, ver AcceptInvitationRequest/ResetPasswordRequest abaixo e RegisterCompanyRequest/
+// DeactivateRequest nos outros domínios).
 type LoginRequest struct {
-	Email    string `json:"email" validate:"required,email"`
-	Password string `json:"password" validate:"required"`
+	Email    string `json:"email" validate:"required,email,max=254"`
+	Password string `json:"password" validate:"required,max=72"`
 }
 
 // TokenPair é o resultado interno de Login/Refresh — nunca serializado
@@ -22,8 +26,8 @@ type TokenPair struct {
 // AcceptInvitationRequest é o payload de POST /auth/invitations/:token/accept
 // — o segundo RH define a própria senha e entra como member.
 type AcceptInvitationRequest struct {
-	Name     string `json:"name" validate:"required"`
-	Password string `json:"password" validate:"required,min=8"`
+	Name     string `json:"name" validate:"required,max=200"`
+	Password string `json:"password" validate:"required,min=8,max=72"`
 }
 
 // AcceptInvitationResponse devolve o e-mail do convite aceito — o front usa isso pra pré-preencher
@@ -34,7 +38,7 @@ type AcceptInvitationResponse struct {
 
 // ForgotPasswordRequest é o payload de POST /auth/password-reset.
 type ForgotPasswordRequest struct {
-	Email string `json:"email" validate:"required,email"`
+	Email string `json:"email" validate:"required,email,max=254"`
 }
 
 // ForgotPasswordResponse nunca revela se o e-mail existe — ResetLink só vem preenchido em
@@ -46,5 +50,5 @@ type ForgotPasswordResponse struct {
 // ResetPasswordRequest é o payload de POST /auth/password-reset/:token — o token vem da URL,
 // mesmo padrão de AcceptInvitationRequest.
 type ResetPasswordRequest struct {
-	NewPassword string `json:"newPassword" validate:"required,min=8"`
+	NewPassword string `json:"newPassword" validate:"required,min=8,max=72"`
 }

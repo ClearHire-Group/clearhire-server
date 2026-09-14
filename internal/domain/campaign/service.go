@@ -12,11 +12,11 @@ import (
 // nunca colunas (ver PhaseCount no model.go). Get/List/Create devolvem isto, não Campaign puro.
 type CampaignView struct {
 	Campaign
-	Phases            []PhaseCount // ordenado por posição
-	TotalCandidates   int
-	CurrentPhaseKey   string
-	FunnelPercent     int
-	HiredCount        int // só relevante/populado quando Status == StatusClosed
+	Phases          []PhaseCount // ordenado por posição
+	TotalCandidates int
+	CurrentPhaseKey string
+	FunnelPercent   int
+	HiredCount      int // só relevante/populado quando Status == StatusClosed
 }
 
 // PerformanceRow é uma linha de GET /reports/campaign-performance.
@@ -34,6 +34,12 @@ type Service interface {
 	TogglePause(ctx context.Context, companyID, id string) (*CampaignView, error)
 	FunnelSummary(ctx context.Context, companyID string) ([]PhaseCount, error)
 	CampaignPerformance(ctx context.Context, companyID string) ([]PerformanceRow, error)
+	// SetPublicApplicationsEnabled liga/desliga o link de candidatura pública desta campanha.
+	SetPublicApplicationsEnabled(ctx context.Context, companyID, id string, enabled bool) (*CampaignView, error)
+	// GetPublicInfo é a única leitura sem tenant deste domínio — chamada de uma rota pública, sem
+	// JWT nenhum. 404 idêntico pra "não existe", "pausada" e "link desligado": nunca diferenciar
+	// pra um chamador anônimo.
+	GetPublicInfo(ctx context.Context, id string) (*PublicInfo, error)
 }
 
 type service struct {
@@ -166,6 +172,42 @@ func (s *service) TogglePause(ctx context.Context, companyID, id string) (*Campa
 	}
 	view := assembleView(*c, phases)
 	return &view, nil
+}
+
+func (s *service) SetPublicApplicationsEnabled(ctx context.Context, companyID, id string, enabled bool) (*CampaignView, error) {
+	c, err := s.repo.FindByID(ctx, companyID, id)
+	if err != nil {
+		return nil, apperror.Internal("falha ao buscar campanha")
+	}
+	if c == nil {
+		return nil, apperror.NotFound("campanha não encontrada")
+	}
+
+	if err := s.repo.SetPublicApplicationsEnabled(ctx, companyID, id, enabled); err != nil {
+		return nil, apperror.Internal("falha ao atualizar link de candidatura")
+	}
+	c.AcceptsPublicApplications = enabled
+
+	phases, err := s.repo.PhaseCountsByCampaign(ctx, companyID, id)
+	if err != nil {
+		return nil, apperror.Internal("falha ao calcular funil da campanha")
+	}
+	view := assembleView(*c, phases)
+	if err := s.populateHiredCount(ctx, companyID, &view); err != nil {
+		return nil, err
+	}
+	return &view, nil
+}
+
+func (s *service) GetPublicInfo(ctx context.Context, id string) (*PublicInfo, error) {
+	info, err := s.repo.FindPublicByID(ctx, id)
+	if err != nil {
+		return nil, apperror.Internal("falha ao buscar vaga")
+	}
+	if info == nil {
+		return nil, apperror.NotFound("vaga não encontrada")
+	}
+	return info, nil
 }
 
 func (s *service) FunnelSummary(ctx context.Context, companyID string) ([]PhaseCount, error) {
