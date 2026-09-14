@@ -12,6 +12,7 @@ import (
 	"github.com/ClearHire-Group/clearhire-server/internal/domain/campaign"
 	"github.com/ClearHire-Group/clearhire-server/internal/domain/candidate"
 	"github.com/ClearHire-Group/clearhire-server/internal/domain/company"
+	"github.com/ClearHire-Group/clearhire-server/internal/domain/dashboard"
 	"github.com/ClearHire-Group/clearhire-server/internal/domain/talent"
 	"github.com/ClearHire-Group/clearhire-server/internal/domain/user"
 	"github.com/ClearHire-Group/clearhire-server/pkg/llm/deterministic"
@@ -27,6 +28,7 @@ type Factory struct {
 	CampaignHandler  *campaign.Handler
 	CandidateHandler *candidate.Handler
 	TalentHandler    *talent.Handler
+	DashboardHandler *dashboard.Handler
 }
 
 func New(db *pgxpool.Pool, cfg *config.Config) *Factory {
@@ -57,5 +59,6 @@ func New(db *pgxpool.Pool, cfg *config.Config) *Factory {
 		CampaignHandler:  InitCampaignFactory(db),
 		CandidateHandler: InitCandidateFactory(db, extractor),
 		TalentHandler:    InitTalentFactory(db),
+		DashboardHandler: InitDashboardFactory(db),
 	}
 }
