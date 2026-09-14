@@ -150,3 +150,4 @@ make run
 | `APP_PORT` | não (default `8080`) | porta HTTP |
 | `DATABASE_URL` | sim | string de conexão do Postgres |
 | `JWT_SECRET` | sim, fora de desenvolvimento | segredo de assinatura dos access tokens |
+| `CORS_ORIGIN` | não (default `http://localhost:4200`) | origem(ns) do frontend autenticado, separadas por vírgula se mais de uma; também usada para montar os links de e-mail de convite/redefinição de senha (ver `internal/factory/factory.go`) |
