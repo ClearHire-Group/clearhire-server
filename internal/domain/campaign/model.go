@@ -28,12 +28,18 @@ type Campaign struct {
 	CompanyID       string
 	CreatedByUserID string
 	Title           string
-	City            string
-	State           string
-	Modality        string
-	ContractType    string
-	Seniority       string
-	Status          Status
+	Description     string
+	// Seções estruturadas da vaga (migration 0006) — exibidas ao candidato no link público.
+	// Opcionais; só Description trava a geração do link.
+	Responsibilities string
+	Requirements     string
+	Benefits         string
+	City             string
+	State            string
+	Modality         string
+	ContractType     string
+	Seniority        string
+	Status           Status
 	// AcceptsPublicApplications é independente de Status — pausar/encerrar a campanha já derruba
 	// o link (a query pública sempre checa as duas colunas juntas), mas o recrutador também pode
 	// ligar/desligar só o link de candidatura sem mexer no status da campanha em si.
@@ -48,14 +54,18 @@ type Campaign struct {
 // PublicInfo é o subconjunto seguro de Campaign pra exibir num link público — nunca
 // CreatedByUserID, contagem de candidatos ou qualquer coisa interna. Ver campaign.Repository.FindPublicByID.
 type PublicInfo struct {
-	ID           string
-	Title        string
-	CompanyName  string
-	City         string
-	State        string
-	Modality     string
-	ContractType string
-	Seniority    string
+	ID               string
+	Title            string
+	CompanyName      string
+	Description      string
+	Responsibilities string
+	Requirements     string
+	Benefits         string
+	City             string
+	State            string
+	Modality         string
+	ContractType     string
+	Seniority        string
 }
 
 // Phase é um módulo do funil configurado pra essa campanha (campaign_phases).

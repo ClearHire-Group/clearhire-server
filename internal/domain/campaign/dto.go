@@ -11,13 +11,19 @@ import (
 // o usuário organizou no step 3 — Recebidos e Selecionados são sempre implícitos, o service quem
 // monta a lista completa. Lista vazia é um funil válido (mínimo: só Recebidos + Selecionados).
 type CreateCampaignRequest struct {
-	Title        string   `json:"title" validate:"required,max=200"`
-	City         string   `json:"city" validate:"omitempty,max=100"`
-	State        string   `json:"state" validate:"omitempty,max=100"`
-	Modality     string   `json:"modality" validate:"required,oneof=remoto hibrido presencial"`
-	ContractType string   `json:"contractType" validate:"required,oneof=clt pj estagio"`
-	Seniority    string   `json:"seniority" validate:"required,oneof=junior pleno senior"`
-	PhaseKeys    []string `json:"phaseKeys" validate:"omitempty,max=3,unique,dive,oneof=fit tecnica entrevista"`
+	Title string `json:"title" validate:"required,max=200"`
+	// Descrição da vaga e suas seções — todas opcionais aqui, mas sem Description a campanha não
+	// consegue ligar o link público depois (ver SetPublicApplicationsEnabled no service).
+	Description      string   `json:"description" validate:"omitempty,max=5000"`
+	Responsibilities string   `json:"responsibilities" validate:"omitempty,max=5000"`
+	Requirements     string   `json:"requirements" validate:"omitempty,max=5000"`
+	Benefits         string   `json:"benefits" validate:"omitempty,max=5000"`
+	City             string   `json:"city" validate:"omitempty,max=100"`
+	State            string   `json:"state" validate:"omitempty,max=100"`
+	Modality         string   `json:"modality" validate:"required,oneof=remoto hibrido presencial"`
+	ContractType     string   `json:"contractType" validate:"required,oneof=clt pj estagio"`
+	Seniority        string   `json:"seniority" validate:"required,oneof=junior pleno senior"`
+	PhaseKeys        []string `json:"phaseKeys" validate:"omitempty,max=3,unique,dive,oneof=fit tecnica entrevista"`
 }
 
 // PhaseResponse espelha Phase do frontend (clearhire-app/src/app/core/models.ts) — key/num/label/count.
@@ -30,9 +36,20 @@ type PhaseResponse struct {
 
 // Response espelha Campaign do frontend byte a byte — nunca devolver o model cru (sem json
 // tags, vazaria PascalCase; mesmo bug já corrigido uma vez neste repo, ver company/dto.go).
+// Location/Meta continuam compostas (telas de leitura), mas os campos crus (City...Description)
+// também vão junto — é o que a tela "Configurações da Campanha" precisa pra pré-preencher o form.
 type Response struct {
 	ID                        string          `json:"id"`
 	Title                     string          `json:"title"`
+	Description               string          `json:"description"`
+	Responsibilities          string          `json:"responsibilities"`
+	Requirements              string          `json:"requirements"`
+	Benefits                  string          `json:"benefits"`
+	City                      string          `json:"city"`
+	State                     string          `json:"state"`
+	Modality                  string          `json:"modality"`
+	ContractType              string          `json:"contractType"`
+	Seniority                 string          `json:"seniority"`
 	Status                    string          `json:"status"`
 	Location                  string          `json:"location"`
 	Meta                      string          `json:"meta"`
@@ -52,6 +69,15 @@ func toResponse(v *CampaignView) *Response {
 	return &Response{
 		ID:                        v.ID,
 		Title:                     v.Title,
+		Description:               v.Description,
+		Responsibilities:          v.Responsibilities,
+		Requirements:              v.Requirements,
+		Benefits:                  v.Benefits,
+		City:                      v.City,
+		State:                     v.State,
+		Modality:                  v.Modality,
+		ContractType:              v.ContractType,
+		Seniority:                 v.Seniority,
 		Status:                    string(v.Status),
 		Location:                  buildLocation(v.Campaign),
 		Meta:                      buildMeta(*v),
@@ -64,6 +90,27 @@ func toResponse(v *CampaignView) *Response {
 	}
 }
 
+// UpdateCampaignRequest é o payload de PATCH /campaigns/:id — mesmas regras de CreateCampaignRequest,
+// menos PhaseKeys (isso é PATCH /campaigns/:id/phases, ver UpdatePhasesRequest).
+type UpdateCampaignRequest struct {
+	Title            string `json:"title" validate:"required,max=200"`
+	Description      string `json:"description" validate:"omitempty,max=5000"`
+	Responsibilities string `json:"responsibilities" validate:"omitempty,max=5000"`
+	Requirements     string `json:"requirements" validate:"omitempty,max=5000"`
+	Benefits         string `json:"benefits" validate:"omitempty,max=5000"`
+	City             string `json:"city" validate:"omitempty,max=100"`
+	State            string `json:"state" validate:"omitempty,max=100"`
+	Modality         string `json:"modality" validate:"required,oneof=remoto hibrido presencial"`
+	ContractType     string `json:"contractType" validate:"required,oneof=clt pj estagio"`
+	Seniority        string `json:"seniority" validate:"required,oneof=junior pleno senior"`
+}
+
+// UpdatePhasesRequest é o payload de PATCH /campaigns/:id/phases — mesma forma de
+// CreateCampaignRequest.PhaseKeys: só os módulos OPCIONAIS, na ordem desejada.
+type UpdatePhasesRequest struct {
+	PhaseKeys []string `json:"phaseKeys" validate:"omitempty,max=3,unique,dive,oneof=fit tecnica entrevista"`
+}
+
 // SetPublicLinkRequest é o payload de POST /campaigns/:id/public-application-link — estado
 // desejado explícito ({enabled: true|false}), não um toggle cego.
 type SetPublicLinkRequest struct {
@@ -73,20 +120,28 @@ type SetPublicLinkRequest struct {
 // PublicInfoResponse é o que GET /public/campaigns/:id devolve pro candidato anônimo — só o
 // necessário pra mostrar a vaga, nunca nada interno (ver PublicInfo no model.go).
 type PublicInfoResponse struct {
-	ID           string `json:"id"`
-	Title        string `json:"title"`
-	CompanyName  string `json:"companyName"`
-	Location     string `json:"location"`
-	Modality     string `json:"modality"`
-	ContractType string `json:"contractType"`
-	Seniority    string `json:"seniority"`
+	ID               string `json:"id"`
+	Title            string `json:"title"`
+	CompanyName      string `json:"companyName"`
+	Description      string `json:"description"`
+	Responsibilities string `json:"responsibilities"`
+	Requirements     string `json:"requirements"`
+	Benefits         string `json:"benefits"`
+	Location         string `json:"location"`
+	Modality         string `json:"modality"`
+	ContractType     string `json:"contractType"`
+	Seniority        string `json:"seniority"`
 }
 
 func toPublicInfoResponse(v *PublicInfo) *PublicInfoResponse {
 	return &PublicInfoResponse{
-		ID:          v.ID,
-		Title:       v.Title,
-		CompanyName: v.CompanyName,
+		ID:               v.ID,
+		Title:            v.Title,
+		CompanyName:      v.CompanyName,
+		Description:      v.Description,
+		Responsibilities: v.Responsibilities,
+		Requirements:     v.Requirements,
+		Benefits:         v.Benefits,
 		Location: buildLocation(Campaign{
 			City: v.City, State: v.State, Modality: v.Modality, ContractType: v.ContractType,
 		}),

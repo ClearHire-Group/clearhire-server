@@ -2,6 +2,8 @@ package campaign
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/ClearHire-Group/clearhire-server/internal/database"
@@ -31,6 +33,12 @@ type Service interface {
 	Get(ctx context.Context, companyID, id string) (*CampaignView, error)
 	List(ctx context.Context, companyID string) ([]CampaignView, error)
 	Create(ctx context.Context, companyID, createdByUserID string, req CreateCampaignRequest) (*CampaignView, error)
+	// Update altera os dados editáveis da campanha (título, descrição, cidade/estado, modalidade,
+	// tipo de contrato, senioridade) — nunca status nem fases, que têm seus próprios métodos.
+	Update(ctx context.Context, companyID, id string, req UpdateCampaignRequest) (*CampaignView, error)
+	// UpdatePhases substitui os módulos OPCIONAIS do funil (fit/tecnica/entrevista) — recusa
+	// remover uma fase que ainda tem candidato nela (ver CandidateCountsByPhase).
+	UpdatePhases(ctx context.Context, companyID, id string, phaseKeys []string) (*CampaignView, error)
 	TogglePause(ctx context.Context, companyID, id string) (*CampaignView, error)
 	FunnelSummary(ctx context.Context, companyID string) ([]PhaseCount, error)
 	CampaignPerformance(ctx context.Context, companyID string) ([]PerformanceRow, error)
@@ -96,14 +104,18 @@ func (s *service) List(ctx context.Context, companyID string) ([]CampaignView, e
 
 func (s *service) Create(ctx context.Context, companyID, createdByUserID string, req CreateCampaignRequest) (*CampaignView, error) {
 	c := &Campaign{
-		CompanyID:       companyID,
-		CreatedByUserID: createdByUserID,
-		Title:           req.Title,
-		City:            req.City,
-		State:           req.State,
-		Modality:        req.Modality,
-		ContractType:    req.ContractType,
-		Seniority:       req.Seniority,
+		CompanyID:        companyID,
+		CreatedByUserID:  createdByUserID,
+		Title:            req.Title,
+		Description:      req.Description,
+		Responsibilities: req.Responsibilities,
+		Requirements:     req.Requirements,
+		Benefits:         req.Benefits,
+		City:             req.City,
+		State:            req.State,
+		Modality:         req.Modality,
+		ContractType:     req.ContractType,
+		Seniority:        req.Seniority,
 	}
 	phases := buildPhases(req.PhaseKeys)
 
@@ -124,6 +136,95 @@ func (s *service) Create(ctx context.Context, companyID, createdByUserID string,
 		counts[i] = PhaseCount{CampaignID: c.ID, Key: p.Key, Position: p.Position, Count: 0}
 	}
 	view := assembleView(*c, counts)
+	return &view, nil
+}
+
+func (s *service) Update(ctx context.Context, companyID, id string, req UpdateCampaignRequest) (*CampaignView, error) {
+	c, err := s.repo.FindByID(ctx, companyID, id)
+	if err != nil {
+		return nil, apperror.Internal("falha ao buscar campanha")
+	}
+	if c == nil {
+		return nil, apperror.NotFound("campanha não encontrada")
+	}
+
+	in := UpdateDetailsInput{
+		Title:            req.Title,
+		Description:      req.Description,
+		Responsibilities: req.Responsibilities,
+		Requirements:     req.Requirements,
+		Benefits:         req.Benefits,
+		City:             req.City,
+		State:            req.State,
+		Modality:         req.Modality,
+		ContractType:     req.ContractType,
+		Seniority:        req.Seniority,
+	}
+	if err := s.repo.UpdateDetails(ctx, companyID, id, in); err != nil {
+		return nil, apperror.Internal("falha ao atualizar campanha")
+	}
+
+	c.Title, c.Description, c.City, c.State = req.Title, req.Description, req.City, req.State
+	c.Responsibilities, c.Requirements, c.Benefits = req.Responsibilities, req.Requirements, req.Benefits
+	c.Modality, c.ContractType, c.Seniority = req.Modality, req.ContractType, req.Seniority
+
+	phases, err := s.repo.PhaseCountsByCampaign(ctx, companyID, id)
+	if err != nil {
+		return nil, apperror.Internal("falha ao calcular funil da campanha")
+	}
+	view := assembleView(*c, phases)
+	if err := s.populateHiredCount(ctx, companyID, &view); err != nil {
+		return nil, err
+	}
+	return &view, nil
+}
+
+func (s *service) UpdatePhases(ctx context.Context, companyID, id string, phaseKeys []string) (*CampaignView, error) {
+	c, err := s.repo.FindByID(ctx, companyID, id)
+	if err != nil {
+		return nil, apperror.Internal("falha ao buscar campanha")
+	}
+	if c == nil {
+		return nil, apperror.NotFound("campanha não encontrada")
+	}
+
+	currentPhases, err := s.repo.PhaseCountsByCampaign(ctx, companyID, id)
+	if err != nil {
+		return nil, apperror.Internal("falha ao calcular funil da campanha")
+	}
+	occupied, err := s.repo.CandidateCountsByPhase(ctx, companyID, id)
+	if err != nil {
+		return nil, apperror.Internal("falha ao verificar candidatos das fases")
+	}
+
+	newPhases := buildPhases(phaseKeys)
+	newKeys := make(map[string]bool, len(newPhases))
+	for _, p := range newPhases {
+		newKeys[p.Key] = true
+	}
+	for _, pc := range currentPhases {
+		if !newKeys[pc.Key] && occupied[pc.Key] > 0 {
+			return nil, apperror.BadRequest(fmt.Sprintf(
+				"não é possível remover a fase '%s': ainda há candidato nela", phaseLabels[pc.Key],
+			))
+		}
+	}
+
+	err = s.withTx(ctx, func(db database.DB) error {
+		return NewRepository(db).ReplacePhases(ctx, id, newPhases)
+	})
+	if err != nil {
+		return nil, apperror.Internal("falha ao atualizar fases da campanha")
+	}
+
+	phases, err := s.repo.PhaseCountsByCampaign(ctx, companyID, id)
+	if err != nil {
+		return nil, apperror.Internal("falha ao calcular funil da campanha")
+	}
+	view := assembleView(*c, phases)
+	if err := s.populateHiredCount(ctx, companyID, &view); err != nil {
+		return nil, err
+	}
 	return &view, nil
 }
 
@@ -181,6 +282,13 @@ func (s *service) SetPublicApplicationsEnabled(ctx context.Context, companyID, i
 	}
 	if c == nil {
 		return nil, apperror.NotFound("campanha não encontrada")
+	}
+
+	// Sem descrição, o link público abriria numa vaga que não diz nada ao candidato — a aba "Vaga"
+	// ficaria vazia. Só barra ao LIGAR: desligar é sempre permitido, e campanha que já está com o
+	// link ativo de antes desta regra continua funcionando.
+	if enabled && strings.TrimSpace(c.Description) == "" {
+		return nil, apperror.BadRequest("preencha a descrição da vaga antes de gerar o link de candidatura")
 	}
 
 	if err := s.repo.SetPublicApplicationsEnabled(ctx, companyID, id, enabled); err != nil {

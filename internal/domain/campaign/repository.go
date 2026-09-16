@@ -19,6 +19,16 @@ type Repository interface {
 	// explícito (não um toggle cego), porque "gerar link" e "desativar link" são duas ações
 	// distintas e idempotentes do recrutador, não uma alternância simétrica.
 	SetPublicApplicationsEnabled(ctx context.Context, companyID, id string, enabled bool) error
+	// UpdateDetails atualiza os campos editáveis da tela "Configurações da Campanha" — nunca
+	// status/timestamps/fases, que têm seus próprios métodos dedicados.
+	UpdateDetails(ctx context.Context, companyID, id string, in UpdateDetailsInput) error
+	// CandidateCountsByPhase é a contagem EXATA (não cumulativa, diferente de PhaseCountsByCampaign)
+	// de candidatos por phase_key — usada só pra decidir se uma fase pode ser removida do funil.
+	CandidateCountsByPhase(ctx context.Context, companyID, campaignID string) (map[string]int, error)
+	// ReplacePhases substitui as fases OPCIONAIS de uma campanha (Recebidos/Selecionados sempre
+	// presentes na lista completa dada) — chamado só depois que o service já validou que nenhuma
+	// fase removida tem candidato nela. phases já vem na ordem final completa (ver buildPhases).
+	ReplacePhases(ctx context.Context, campaignID string, phases []Phase) error
 	// FindPublicByID NÃO recebe companyID — quem chama é anônimo, sem tenant nenhum. A própria
 	// query faz a checagem de elegibilidade (status ativa + link ligado + não deletada); nil, nil
 	// cobre "não existe" e "existe mas não está elegível" com o mesmo resultado, de propósito —
@@ -42,13 +52,17 @@ func NewRepository(db database.DB) Repository {
 	return &postgresRepository{db: db}
 }
 
-const campaignColumns = `id, company_id, created_by_user_id, title, coalesce(city, ''), coalesce(state, ''),
+const campaignColumns = `id, company_id, created_by_user_id, title, coalesce(description, ''),
+	coalesce(responsibilities, ''), coalesce(requirements, ''), coalesce(benefits, ''),
+	coalesce(city, ''), coalesce(state, ''),
 	modality, contract_type, seniority, status, accepts_public_applications, opened_at, paused_at, closed_at, created_at, updated_at`
 
 func scanCampaign(row pgx.Row) (*Campaign, error) {
 	var c Campaign
 	err := row.Scan(
-		&c.ID, &c.CompanyID, &c.CreatedByUserID, &c.Title, &c.City, &c.State,
+		&c.ID, &c.CompanyID, &c.CreatedByUserID, &c.Title, &c.Description,
+		&c.Responsibilities, &c.Requirements, &c.Benefits,
+		&c.City, &c.State,
 		&c.Modality, &c.ContractType, &c.Seniority, &c.Status, &c.AcceptsPublicApplications, &c.OpenedAt, &c.PausedAt, &c.ClosedAt,
 		&c.CreatedAt, &c.UpdatedAt,
 	)
@@ -93,10 +107,13 @@ func (r *postgresRepository) ListByCompany(ctx context.Context, companyID string
 
 func (r *postgresRepository) Create(ctx context.Context, c *Campaign, phases []Phase) error {
 	row := r.db.QueryRow(ctx, `
-		insert into campaigns (company_id, created_by_user_id, title, city, state, modality, contract_type, seniority)
-		values ($1, $2, $3, nullif($4, ''), nullif($5, ''), $6, $7, $8)
+		insert into campaigns (company_id, created_by_user_id, title, description, responsibilities, requirements,
+		                       benefits, city, state, modality, contract_type, seniority)
+		values ($1, $2, $3, nullif($4, ''), nullif($5, ''), nullif($6, ''),
+		        nullif($7, ''), nullif($8, ''), nullif($9, ''), $10, $11, $12)
 		returning id, status, opened_at, created_at, updated_at
-	`, c.CompanyID, c.CreatedByUserID, c.Title, c.City, c.State, c.Modality, c.ContractType, c.Seniority)
+	`, c.CompanyID, c.CreatedByUserID, c.Title, c.Description, c.Responsibilities, c.Requirements,
+		c.Benefits, c.City, c.State, c.Modality, c.ContractType, c.Seniority)
 	if err := row.Scan(&c.ID, &c.Status, &c.OpenedAt, &c.CreatedAt, &c.UpdatedAt); err != nil {
 		return err
 	}
@@ -128,16 +145,101 @@ func (r *postgresRepository) SetPublicApplicationsEnabled(ctx context.Context, c
 	return err
 }
 
+// UpdateDetailsInput é o subconjunto de Campaign editável pela tela "Configurações da Campanha" —
+// nunca status/timestamps/fases, que têm seus próprios métodos dedicados.
+type UpdateDetailsInput struct {
+	Title            string
+	Description      string
+	Responsibilities string
+	Requirements     string
+	Benefits         string
+	City             string
+	State            string
+	Modality         string
+	ContractType     string
+	Seniority        string
+}
+
+func (r *postgresRepository) UpdateDetails(ctx context.Context, companyID, id string, in UpdateDetailsInput) error {
+	_, err := r.db.Exec(ctx, `
+		update campaigns
+		set title = $3, description = nullif($4, ''), responsibilities = nullif($5, ''),
+		    requirements = nullif($6, ''), benefits = nullif($7, ''),
+		    city = nullif($8, ''), state = nullif($9, ''),
+		    modality = $10, contract_type = $11, seniority = $12
+		where id = $1 and company_id = $2 and deleted_at is null
+	`, id, companyID, in.Title, in.Description, in.Responsibilities, in.Requirements, in.Benefits,
+		in.City, in.State, in.Modality, in.ContractType, in.Seniority)
+	return err
+}
+
+// CandidateCountsByPhase devolve a contagem EXATA de candidatos por phase_key (quem está
+// sentado ali agora, não cumulativa como PhaseCountsByCampaign) — só serve pra decidir se uma
+// fase pode ser removida do funil sem violar a FK (campaign_id, phase_key) de candidates.
+func (r *postgresRepository) CandidateCountsByPhase(ctx context.Context, companyID, campaignID string) (map[string]int, error) {
+	rows, err := r.db.Query(ctx, `
+		select c.phase_key, count(*)
+		from candidates c
+		join campaigns camp on camp.id = c.campaign_id and camp.company_id = $1 and camp.deleted_at is null
+		where c.campaign_id = $2 and c.deleted_at is null
+		group by c.phase_key
+	`, companyID, campaignID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	counts := make(map[string]int)
+	for rows.Next() {
+		var key string
+		var count int
+		if err := rows.Scan(&key, &count); err != nil {
+			return nil, err
+		}
+		counts[key] = count
+	}
+	return counts, rows.Err()
+}
+
+// ReplacePhases substitui as fases de uma campanha pela lista final dada (já com Recebidos/
+// Selecionados incluídos — ver buildPhases). O UPSERT + o DELETE na mesma transação dependem da
+// constraint unique(campaign_id, position) ser DEFERRABLE (ver migrations/0001_init.sql) pra
+// trocas de posição não colidirem no meio do caminho.
+func (r *postgresRepository) ReplacePhases(ctx context.Context, campaignID string, phases []Phase) error {
+	keys := make([]string, len(phases))
+	for i, p := range phases {
+		keys[i] = p.Key
+	}
+	if _, err := r.db.Exec(ctx, `
+		delete from campaign_phases where campaign_id = $1 and phase_key <> all($2)
+	`, campaignID, keys); err != nil {
+		return err
+	}
+
+	for _, p := range phases {
+		if _, err := r.db.Exec(ctx, `
+			insert into campaign_phases (campaign_id, phase_key, position)
+			values ($1, $2, $3)
+			on conflict (campaign_id, phase_key) do update set position = excluded.position
+		`, campaignID, p.Key, p.Position); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (r *postgresRepository) FindPublicByID(ctx context.Context, id string) (*PublicInfo, error) {
 	row := r.db.QueryRow(ctx, `
-		select c.id, c.title, co.name, coalesce(c.city, ''), coalesce(c.state, ''),
+		select c.id, c.title, co.name, coalesce(c.description, ''), coalesce(c.responsibilities, ''),
+		       coalesce(c.requirements, ''), coalesce(c.benefits, ''), coalesce(c.city, ''), coalesce(c.state, ''),
 		       c.modality, c.contract_type, c.seniority
 		from campaigns c
 		join companies co on co.id = c.company_id
 		where c.id = $1 and c.status = 'ativa' and c.accepts_public_applications and c.deleted_at is null
 	`, id)
 	var info PublicInfo
-	err := row.Scan(&info.ID, &info.Title, &info.CompanyName, &info.City, &info.State,
+	err := row.Scan(&info.ID, &info.Title, &info.CompanyName, &info.Description, &info.Responsibilities,
+		&info.Requirements, &info.Benefits, &info.City, &info.State,
 		&info.Modality, &info.ContractType, &info.Seniority)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

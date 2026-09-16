@@ -159,6 +159,70 @@ o scoring de Fit Cultural existir, esta nota precisa ser revisitada).
 
 ---
 
+### `PATCH /campaigns/:id` — atualizar dados da campanha
+
+Protegido. Seção "Dados da campanha" em Configurações da Campanha — título,
+descrição, cidade/estado, modalidade, tipo de contrato e senioridade. Nunca
+altera status nem fases do funil (ver endpoint abaixo).
+
+**Request**
+```json
+{
+  "title": "Engenheiro(a) de Software Sênior — Backend",
+  "description": "Vaga para o time de plataforma...",
+  "city": "São Paulo",
+  "state": "SP",
+  "modality": "hibrido",
+  "contractType": "clt",
+  "seniority": "senior"
+}
+```
+
+| Campo | Obrigatório | Regra |
+|---|---|---|
+| `title` | sim | máximo 200 caracteres |
+| `description` | não | máximo 5000 caracteres |
+| `city` / `state` | não | máximo 100 caracteres cada |
+| `modality` | sim | `remoto` \| `hibrido` \| `presencial` |
+| `contractType` | sim | `clt` \| `pj` \| `estagio` |
+| `seniority` | sim | `junior` \| `pleno` \| `senior` |
+
+**Resposta — `200 OK`**: mesmo formato de `GET /campaigns/:id`, já com os
+valores salvos.
+
+**Erros**
+| Status | Quando |
+|---|---|
+| `400` | payload inválido |
+| `404` | campanha não existe (ou não pertence à empresa do token) |
+
+---
+
+### `PATCH /campaigns/:id/phases` — atualizar fases do funil
+
+Protegido. Seção "Fases do funil" em Configurações da Campanha — adiciona,
+remove e reordena os módulos opcionais (`fit`/`tecnica`/`entrevista`).
+"Recebidos" e "Selecionados" são sempre implícitas, nunca vão em `phaseKeys`.
+
+**Request**
+```json
+{ "phaseKeys": ["tecnica", "entrevista"] }
+```
+
+| Campo | Obrigatório | Regra |
+|---|---|---|
+| `phaseKeys` | não (lista vazia é funil válido) | máximo 3 itens, sem repetição, cada um `fit`\|`tecnica`\|`entrevista` |
+
+**Resposta — `200 OK`**: mesmo formato de `GET /campaigns/:id`.
+
+**Erros**
+| Status | Quando |
+|---|---|
+| `400` | payload inválido, **ou** a lista nova remove uma fase que ainda tem candidato nela |
+| `404` | campanha não existe (ou não pertence à empresa do token) |
+
+---
+
 ## Ainda não implementado
 
 Rota registrada e respondendo `501 não implementado` (sem lógica por trás):
@@ -167,9 +231,15 @@ Rota registrada e respondendo `501 não implementado` (sem lógica por trás):
 |---|---|
 | `POST /auth/invitations/:token/accept` | segundo RH aceita convite e define senha |
 | `GET /users/:id` · `PATCH /users/:id` · `DELETE /users/:id` | perfil de RH / desativar assento |
-| `GET /campaigns` · `POST /campaigns` · `GET /campaigns/:id` · `POST /campaigns/:id/toggle-pause` | vagas |
 | `GET /candidates/:id` · `POST /candidates/:id/decisions` | candidatos e decisões manuais |
 | `GET /talents` · `POST /talents` · `GET /talents/search` · `GET /talents/:id` | banco de talentos |
+
+`GET /campaigns` · `POST /campaigns` · `GET /campaigns/:id` ·
+`POST /campaigns/:id/toggle-pause` · `POST /campaigns/:id/public-application-link`
+já estão implementados (fora desta lista) — não documentados nesta versão do
+arquivo com o mesmo detalhe de `PATCH /campaigns/:id` acima; ver
+`internal/domain/campaign/handler.go` como fonte de verdade enquanto a seção
+completa de campanhas não sobe pra "Endpoints implementados".
 
 Todos exigem token exceto onde marcado público acima. Conforme cada um saia
 do esqueleto, a seção dele sobe pra "Endpoints implementados" com o mesmo

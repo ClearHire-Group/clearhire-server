@@ -25,6 +25,8 @@ func (h *Handler) RegisterRoutes(router fiber.Router) {
 	group.Get("/", h.List)
 	group.Post("/", h.Create)
 	group.Get("/:id", h.Get)
+	group.Patch("/:id", h.Update)
+	group.Patch("/:id/phases", h.UpdatePhases)
 	group.Post("/:id/toggle-pause", h.TogglePause)
 	group.Post("/:id/public-application-link", h.SetPublicLink)
 }
@@ -78,6 +80,46 @@ func (h *Handler) Get(c *fiber.Ctx) error {
 		return nil
 	}
 	view, err := h.service.Get(c.Context(), middleware.CompanyID(c), id)
+	if err != nil {
+		return h.respondError(c, err)
+	}
+	return response.OK(c, toResponse(view))
+}
+
+func (h *Handler) Update(c *fiber.Ctx) error {
+	id, ok := idparam.Valid(c, "id")
+	if !ok {
+		return nil
+	}
+	var req UpdateCampaignRequest
+	if err := c.BodyParser(&req); err != nil {
+		return response.Err(c, fiber.StatusBadRequest, "payload inválido")
+	}
+	if err := validator.Validate(req); err != nil {
+		return response.Err(c, fiber.StatusBadRequest, "dados obrigatórios faltando ou inválidos")
+	}
+
+	view, err := h.service.Update(c.Context(), middleware.CompanyID(c), id, req)
+	if err != nil {
+		return h.respondError(c, err)
+	}
+	return response.OK(c, toResponse(view))
+}
+
+func (h *Handler) UpdatePhases(c *fiber.Ctx) error {
+	id, ok := idparam.Valid(c, "id")
+	if !ok {
+		return nil
+	}
+	var req UpdatePhasesRequest
+	if err := c.BodyParser(&req); err != nil {
+		return response.Err(c, fiber.StatusBadRequest, "payload inválido")
+	}
+	if err := validator.Validate(req); err != nil {
+		return response.Err(c, fiber.StatusBadRequest, "dados obrigatórios faltando ou inválidos")
+	}
+
+	view, err := h.service.UpdatePhases(c.Context(), middleware.CompanyID(c), id, req.PhaseKeys)
 	if err != nil {
 		return h.respondError(c, err)
 	}
