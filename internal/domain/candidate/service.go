@@ -3,8 +3,10 @@ package candidate
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/ClearHire-Group/clearhire-server/internal/database"
+	"github.com/ClearHire-Group/clearhire-server/internal/domain/activity"
 	"github.com/ClearHire-Group/clearhire-server/pkg/apperror"
 	"github.com/ClearHire-Group/clearhire-server/pkg/llm"
 )
@@ -94,10 +96,14 @@ func (s *service) Decide(ctx context.Context, companyID, id string, req DecideRe
 			assessmentIDPtr = &assessmentID
 		}
 
+		// Mesmo db da tx: a linha do feed e a decisão são o mesmo evento — uma decisão que deu
+		// rollback não pode deixar rastro no histórico.
+		feed := activity.NewRepository(db)
+
 		if req.Decision == "avancar" {
-			result, err = advance(ctx, txRepo, companyID, cand, assessmentIDPtr, decidedByUserID)
+			result, err = advance(ctx, txRepo, feed, companyID, cand, assessmentIDPtr, decidedByUserID)
 		} else {
-			result, err = reject(ctx, txRepo, companyID, cand, req, assessmentIDPtr, decidedByUserID)
+			result, err = reject(ctx, txRepo, feed, companyID, cand, req, assessmentIDPtr, decidedByUserID)
 		}
 		return err
 	})
@@ -130,7 +136,7 @@ func nextPhase(phases []PhaseRow, currentKey string) *PhaseRow {
 	return best
 }
 
-func advance(ctx context.Context, repo Repository, companyID string, cand *Candidate, assessmentID *string, decidedByUserID string) (*DecideResult, error) {
+func advance(ctx context.Context, repo Repository, feed activity.Repository, companyID string, cand *Candidate, assessmentID *string, decidedByUserID string) (*DecideResult, error) {
 	phases, err := repo.FindPhasesByCampaign(ctx, companyID, cand.CampaignID)
 	if err != nil {
 		return nil, apperror.Internal("falha ao buscar fases da campanha")
@@ -167,10 +173,18 @@ func advance(ctx context.Context, repo Repository, companyID string, cand *Candi
 		return nil, apperror.Internal("falha ao registrar decisão")
 	}
 
+	if err := feed.Create(ctx, &activity.Entry{
+		CompanyID: companyID, CampaignID: &cand.CampaignID,
+		Actor: activity.ActorRecruiter, ActorUserID: &decidedByUserID,
+		Message: fmt.Sprintf("%s avançou para %s.", cand.Name, phaseLabel(next.Key)),
+	}); err != nil {
+		return nil, apperror.Internal("falha ao registrar atividade")
+	}
+
 	return &DecideResult{Phase: next.Key}, nil
 }
 
-func reject(ctx context.Context, repo Repository, companyID string, cand *Candidate, req DecideRequest, assessmentID *string, decidedByUserID string) (*DecideResult, error) {
+func reject(ctx context.Context, repo Repository, feed activity.Repository, companyID string, cand *Candidate, req DecideRequest, assessmentID *string, decidedByUserID string) (*DecideResult, error) {
 	reasonKey := *req.RejectionReasonKey
 
 	var talentIDPtr *string
@@ -209,6 +223,18 @@ func reject(ctx context.Context, repo Repository, companyID string, cand *Candid
 		AssessmentID: assessmentID, Decision: "reprovar", FromPhase: cand.PhaseKey, RejectionReasonKey: &reasonKey,
 	}); err != nil {
 		return nil, apperror.Internal("falha ao registrar decisão")
+	}
+
+	message := fmt.Sprintf("Reprovação registrada para %s em %s.", cand.Name, phaseLabel(cand.PhaseKey))
+	if talentIDPtr != nil {
+		message = fmt.Sprintf("Reprovação registrada para %s em %s — perfil adicionado ao Banco de Talentos.", cand.Name, phaseLabel(cand.PhaseKey))
+	}
+	if err := feed.Create(ctx, &activity.Entry{
+		CompanyID: companyID, CampaignID: &cand.CampaignID,
+		Actor: activity.ActorRecruiter, ActorUserID: &decidedByUserID,
+		Message: message,
+	}); err != nil {
+		return nil, apperror.Internal("falha ao registrar atividade")
 	}
 
 	return &DecideResult{TalentID: talentIDPtr}, nil
@@ -342,6 +368,17 @@ func (s *service) RegisterPublicApplication(ctx context.Context, campaignID stri
 			if err := txRepo.InsertTalentSourceDocument(ctx, talentID, profile.RawText); err != nil {
 				return apperror.Internal("falha ao registrar currículo")
 			}
+		}
+
+		// Actor 'ia' e ActorUserID nil: não há usuário logado nesta rota (candidato anônimo pelo link
+		// público) e actor_type não tem valor pra "candidato". 'ia' é o mesmo enquadramento que o
+		// front já usava pra chegada de candidatura ("IA recebeu e organizou N candidaturas").
+		if err := activity.NewRepository(db).Create(ctx, &activity.Entry{
+			CompanyID: ref.CompanyID, CampaignID: &campaignID,
+			Actor: activity.ActorAI, ActorUserID: nil,
+			Message: fmt.Sprintf("Nova candidatura recebida pelo link público: %s.", profile.Name),
+		}); err != nil {
+			return apperror.Internal("falha ao registrar atividade")
 		}
 		return nil
 	})

@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/ClearHire-Group/clearhire-server/internal/config"
+	"github.com/ClearHire-Group/clearhire-server/internal/domain/activity"
 	"github.com/ClearHire-Group/clearhire-server/internal/domain/auth"
 	"github.com/ClearHire-Group/clearhire-server/internal/domain/campaign"
 	"github.com/ClearHire-Group/clearhire-server/internal/domain/candidate"
@@ -29,6 +30,7 @@ type Factory struct {
 	CandidateHandler *candidate.Handler
 	TalentHandler    *talent.Handler
 	DashboardHandler *dashboard.Handler
+	ActivityHandler  *activity.Handler
 }
 
 func New(db *pgxpool.Pool, cfg *config.Config) *Factory {
@@ -60,5 +62,6 @@ func New(db *pgxpool.Pool, cfg *config.Config) *Factory {
 		CandidateHandler: InitCandidateFactory(db, extractor),
 		TalentHandler:    InitTalentFactory(db),
 		DashboardHandler: InitDashboardFactory(db),
+		ActivityHandler:  InitActivityFactory(db),
 	}
 }

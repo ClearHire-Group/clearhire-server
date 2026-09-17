@@ -56,6 +56,15 @@ var phaseLabels = map[string]string{
 	PhaseSelecionados: "Selecionados",
 }
 
+// phaseLabel cai de volta na própria chave quando a fase não está no mapa — o rótulo só alimenta
+// texto de UI, então uma chave crua é degradação aceitável, melhor que string vazia.
+func phaseLabel(key string) string {
+	if label, ok := phaseLabels[key]; ok {
+		return label
+	}
+	return key
+}
+
 // statusLabel traduz (status, fase) pro rótulo em português que a tela já sabe estilizar (ver
 // clearhire-app core/candidate-view.ts, STATUS_STYLES — as strings aqui têm que bater exatamente
 // com as chaves de lá, inclusive o "·" entre "Em análise" e o nome da fase).

@@ -131,7 +131,7 @@ func (h *Handler) TogglePause(c *fiber.Ctx) error {
 	if !ok {
 		return nil
 	}
-	view, err := h.service.TogglePause(c.Context(), middleware.CompanyID(c), id)
+	view, err := h.service.TogglePause(c.Context(), middleware.CompanyID(c), id, middleware.UserID(c))
 	if err != nil {
 		return h.respondError(c, err)
 	}

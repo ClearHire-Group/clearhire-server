@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ClearHire-Group/clearhire-server/internal/database"
+	"github.com/ClearHire-Group/clearhire-server/internal/domain/activity"
 	"github.com/ClearHire-Group/clearhire-server/pkg/apperror"
 )
 
@@ -39,7 +40,9 @@ type Service interface {
 	// UpdatePhases substitui os módulos OPCIONAIS do funil (fit/tecnica/entrevista) — recusa
 	// remover uma fase que ainda tem candidato nela (ver CandidateCountsByPhase).
 	UpdatePhases(ctx context.Context, companyID, id string, phaseKeys []string) (*CampaignView, error)
-	TogglePause(ctx context.Context, companyID, id string) (*CampaignView, error)
+	// TogglePause recebe actedByUserID só pra registrar quem pausou/retomou no feed de atividade —
+	// a decisão em si não depende de quem chama (qualquer RH da empresa pode).
+	TogglePause(ctx context.Context, companyID, id, actedByUserID string) (*CampaignView, error)
 	FunnelSummary(ctx context.Context, companyID string) ([]PhaseCount, error)
 	CampaignPerformance(ctx context.Context, companyID string) ([]PerformanceRow, error)
 	// SetPublicApplicationsEnabled liga/desliga o link de candidatura pública desta campanha.
@@ -123,7 +126,14 @@ func (s *service) Create(ctx context.Context, companyID, createdByUserID string,
 	// uma campanha sem nenhuma fase configurada — quebrando a FK que todo candidato dessa
 	// campanha vai depender (campaigns.id, phase_key -> campaign_phases).
 	err := s.withTx(ctx, func(db database.DB) error {
-		return NewRepository(db).Create(ctx, c, phases)
+		if err := NewRepository(db).Create(ctx, c, phases); err != nil {
+			return err
+		}
+		return activity.NewRepository(db).Create(ctx, &activity.Entry{
+			CompanyID: companyID, CampaignID: &c.ID,
+			Actor: activity.ActorRecruiter, ActorUserID: &createdByUserID,
+			Message: fmt.Sprintf("Campanha criada com %d fases no funil.", len(phases)),
+		})
 	})
 	if err != nil {
 		return nil, apperror.Internal("falha ao criar campanha")
@@ -228,7 +238,7 @@ func (s *service) UpdatePhases(ctx context.Context, companyID, id string, phaseK
 	return &view, nil
 }
 
-func (s *service) TogglePause(ctx context.Context, companyID, id string) (*CampaignView, error) {
+func (s *service) TogglePause(ctx context.Context, companyID, id, actedByUserID string) (*CampaignView, error) {
 	c, err := s.repo.FindByID(ctx, companyID, id)
 	if err != nil {
 		return nil, apperror.Internal("falha ao buscar campanha")
@@ -261,7 +271,22 @@ func (s *service) TogglePause(ctx context.Context, companyID, id string) (*Campa
 		pausedAt = &now
 	}
 
-	if err := s.repo.SetStatus(ctx, companyID, id, newStatus, pausedAt); err != nil {
+	// Mudança de status + linha do feed na mesma transação, pelo mesmo motivo de Create: um feed que
+	// registra uma pausa que não aconteceu é pior que não registrar nada.
+	message := "Campanha pausada."
+	if newStatus == StatusActive {
+		message = "Campanha retomada."
+	}
+	if err := s.withTx(ctx, func(db database.DB) error {
+		if err := NewRepository(db).SetStatus(ctx, companyID, id, newStatus, pausedAt); err != nil {
+			return err
+		}
+		return activity.NewRepository(db).Create(ctx, &activity.Entry{
+			CompanyID: companyID, CampaignID: &id,
+			Actor: activity.ActorRecruiter, ActorUserID: &actedByUserID,
+			Message: message,
+		})
+	}); err != nil {
 		return nil, apperror.Internal("falha ao atualizar campanha")
 	}
 

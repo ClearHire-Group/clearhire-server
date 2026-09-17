@@ -223,6 +223,42 @@ remove e reordena os módulos opcionais (`fit`/`tecnica`/`entrevista`).
 
 ---
 
+### `GET /dashboard/activity` — feed de atividade
+
+Protegido. Aba "Atividade" do Dashboard — histórico de ações da IA e decisões
+manuais da empresa inteira, mais recente primeiro.
+
+**Query**
+
+| Parâmetro | Obrigatório | Regra |
+|---|---|---|
+| `limit` | não | default `50`, teto `200`; valor fora da faixa é truncado, nunca `400` |
+
+**Resposta — `200 OK`**
+```json
+{ "success": true, "data": [
+  { "id": "3fac…", "actor": "recrutador", "message": "Campanha pausada.",
+    "campaignId": "6726…", "campaignTitle": "Eng. Backend Sênior",
+    "createdAt": "2026-09-17T14:58:57.016817-03:00" }
+] }
+```
+
+`actor` é `ia` ou `recrutador`. `campaignId`/`campaignTitle` são **omitidos
+juntos** em dois casos: ação de nível empresa (`activity_feed.campaign_id` é
+nulável) e campanha arquivada — nos dois o front renderiza a linha sem link,
+em vez de um link que abriria em `404`.
+
+`createdAt` é ISO 8601, não rótulo pronto: o texto relativo ("há 12 minutos")
+é derivado no cliente a cada render (`clearhire-app core/relative-time.ts`),
+senão congelaria no instante da resposta.
+
+**Escrita**: não há endpoint pra inserir no feed. As linhas são gravadas pelos
+próprios domínios, **na mesma transação** da ação que registram — criar campanha,
+pausar/retomar, avançar/reprovar candidato e candidatura pública recebida. Uma
+ação que deu rollback não deixa rastro no histórico.
+
+---
+
 ## Ainda não implementado
 
 Rota registrada e respondendo `501 não implementado` (sem lógica por trás):
