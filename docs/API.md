@@ -277,6 +277,19 @@ arquivo com o mesmo detalhe de `PATCH /campaigns/:id` acima; ver
 `internal/domain/campaign/handler.go` como fonte de verdade enquanto a seção
 completa de campanhas não sobe pra "Endpoints implementados".
 
+### Listagens: tamanho, compressão e ordenação
+
+- Toda resposta fora de `/auth` sai comprimida (gzip/brotli, conforme `Accept-Encoding`). `/auth` fica de fora
+  de propósito (BREACH: o login devolve o token no corpo).
+- `GET /talents` devolve cada talento **resumido**: experiências sem descrição e `history: []`. O perfil
+  completo é `GET /talents/:id`. Medido com 3 mil talentos: 8,5 MB → 231 KB.
+- `GET /campaigns/:id/candidates` traz `yearsExperience` (número) e `appliedAt` (ISO) além dos rótulos de texto,
+  para a tela ordenar por experiência e data.
+- **Ordenação, filtro e busca rápida dessas listas rodam no navegador**, sobre a lista carregada
+  (`clearhire-app/src/app/core/table-sort.ts`): ~2 ms para 3 mil linhas. A API não aceita parâmetros de
+  ordenação. Se as listas passarem de dezenas de milhares de linhas, o caminho é paginar no servidor, com a
+  ordenação indo junto por uma lista fechada de colunas.
+
 ### Banco de Talentos — `/talents`
 
 Protegido, escopado pela empresa do token. **Quem está no banco** (`talents.bank_entered_at` preenchido,

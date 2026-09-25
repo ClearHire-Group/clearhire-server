@@ -4,9 +4,11 @@
 package server
 
 import (
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/compress"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/helmet"
 	"github.com/gofiber/fiber/v2/middleware/logger"
@@ -44,6 +46,19 @@ func New(cfg *config.Config) *fiber.App {
 	})
 
 	app.Use(recover.New())
+	// Compressão das respostas: JSON de listagem é muito repetitivo e cai para ~5-10% do tamanho (a
+	// listagem de 3 mil talentos passava de 8 MB crus). LevelBestSpeed porque o gargalo é a rede, não a
+	// taxa de compressão.
+	//
+	// /auth fica de fora de propósito (BREACH): comprimir uma resposta que carrega um segredo (o token
+	// de acesso no corpo do login) junto com dado controlado por quem pede deixa o tamanho comprimido
+	// vazar o segredo. Nenhuma outra rota devolve segredo no corpo.
+	app.Use(compress.New(compress.Config{
+		Level: compress.LevelBestSpeed,
+		Next: func(c *fiber.Ctx) bool {
+			return strings.HasPrefix(c.Path(), "/api/v1/auth")
+		},
+	}))
 	app.Use(logger.New())
 	// Headers de resposta padrão (X-Content-Type-Options, X-Frame-Options, HSTS quando servido
 	// por HTTPS, etc.) — API pura em JSON não tem muita superfície de HTML/frame pra proteger,

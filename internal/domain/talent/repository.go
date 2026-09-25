@@ -70,7 +70,9 @@ func (r *postgresRepository) ListInBank(ctx context.Context, companyID string) (
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	if err := r.loadDetails(ctx, talents); err != nil {
+	// Listagem é resumo: sem descrição de experiência e sem histórico — a tabela não mostra nenhum dos
+	// dois e eles eram ~metade do tamanho da resposta. O perfil completo vem de FindInBank.
+	if err := r.loadDetails(ctx, talents, false); err != nil {
 		return nil, err
 	}
 	return talents, nil
@@ -86,7 +88,7 @@ func (r *postgresRepository) FindInBank(ctx context.Context, companyID, id strin
 		return nil, err
 	}
 	list := []Talent{*t}
-	if err := r.loadDetails(ctx, list); err != nil {
+	if err := r.loadDetails(ctx, list, true); err != nil {
 		return nil, err
 	}
 	return &list[0], nil
@@ -95,7 +97,9 @@ func (r *postgresRepository) FindInBank(ctx context.Context, companyID, id strin
 // loadDetails carrega skills, idiomas, setores, experiência e histórico de TODOS os talentos com uma
 // consulta por tipo (não uma por talento): a listagem do banco mostra skills de cada linha, e N+1
 // consultas cresceriam com o tamanho do banco.
-func (r *postgresRepository) loadDetails(ctx context.Context, talents []Talent) error {
+//
+// full=false (listagem) deixa de fora a descrição das experiências e o histórico.
+func (r *postgresRepository) loadDetails(ctx context.Context, talents []Talent, full bool) error {
 	if len(talents) == 0 {
 		return nil
 	}
@@ -111,6 +115,8 @@ func (r *postgresRepository) loadDetails(ctx context.Context, talents []Talent) 
 	type loader struct {
 		sql  string
 		scan func(rows pgx.Rows) error
+		// passFull: a consulta recebe `full` como $2.
+		passFull bool
 	}
 	loaders := []loader{
 		{`select ts.talent_id, s.canonical_term::text, coalesce(ts.level, ''), ts.years_experience
@@ -124,7 +130,7 @@ func (r *postgresRepository) loadDetails(ctx context.Context, talents []Talent) 
 				}
 				index[id].Skills = append(index[id].Skills, s)
 				return nil
-			}},
+			}, false},
 		{`select tl.talent_id, l.name::text, coalesce(tl.proficiency, '')
 		  from talent_languages tl join languages l on l.id = tl.language_id
 		  where tl.talent_id = any($1) order by l.name`,
@@ -136,7 +142,7 @@ func (r *postgresRepository) loadDetails(ctx context.Context, talents []Talent) 
 				}
 				index[id].Languages = append(index[id].Languages, l)
 				return nil
-			}},
+			}, false},
 		{`select ts.talent_id, s.name::text from talent_sectors ts join sectors s on s.id = ts.sector_id
 		  where ts.talent_id = any($1) order by s.name`,
 			func(rows pgx.Rows) error {
@@ -146,8 +152,8 @@ func (r *postgresRepository) loadDetails(ctx context.Context, talents []Talent) 
 				}
 				index[id].Sectors = append(index[id].Sectors, name)
 				return nil
-			}},
-		{`select talent_id, role, company, period_label, coalesce(description, '')
+			}, false},
+		{`select talent_id, role, company, period_label, case when $2 then coalesce(description, '') else '' end
 		  from talent_experience_entries where talent_id = any($1) order by position`,
 			func(rows pgx.Rows) error {
 				var id string
@@ -157,7 +163,7 @@ func (r *postgresRepository) loadDetails(ctx context.Context, talents []Talent) 
 				}
 				index[id].Experience = append(index[id].Experience, e)
 				return nil
-			}},
+			}, true},
 		{`select c.talent_id, c.campaign_id, camp.title, c.phase_key::text, c.status::text, c.rejection_reason_key
 		  from candidates c join campaigns camp on camp.id = c.campaign_id
 		  where c.talent_id = any($1) and c.deleted_at is null order by c.created_at desc`,
@@ -169,10 +175,17 @@ func (r *postgresRepository) loadDetails(ctx context.Context, talents []Talent) 
 				}
 				index[id].History = append(index[id].History, h)
 				return nil
-			}},
+			}, false},
+	}
+	if !full {
+		loaders = loaders[:len(loaders)-1] // o histórico é o último
 	}
 	for _, l := range loaders {
-		rows, err := r.db.Query(ctx, l.sql, ids)
+		args := []any{ids}
+		if l.passFull {
+			args = append(args, full)
+		}
+		rows, err := r.db.Query(ctx, l.sql, args...)
 		if err != nil {
 			return err
 		}

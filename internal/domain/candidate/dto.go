@@ -3,6 +3,7 @@ package candidate
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 // initials devolve as duas letras que a bolinha de avatar mostra ("Marina Albuquerque" -> "MA").
@@ -117,14 +118,18 @@ func locationLabel(city, state string) string {
 // de campanha lista. avatarColorIndex é derivado do id (determinístico: mesmo candidato sempre cai
 // na mesma cor, sem precisar persistir isso em lugar nenhum).
 type CandidateResponse struct {
-	ID                 string  `json:"id"`
-	CampaignID         string  `json:"campaignId"`
-	Phase              string  `json:"phase"`
-	Name               string  `json:"name"`
-	Email              string  `json:"email"`
-	Experience         string  `json:"experience"`
-	Location           string  `json:"location"`
-	MatchPct           *int    `json:"matchPct"`
+	ID         string `json:"id"`
+	CampaignID string `json:"campaignId"`
+	Phase      string `json:"phase"`
+	Name       string `json:"name"`
+	Email      string `json:"email"`
+	Experience string `json:"experience"`
+	Location   string `json:"location"`
+	MatchPct   *int   `json:"matchPct"`
+	// YearsExperience e AppliedAt existem para ORDENAR a listagem (os rótulos de texto acima não
+	// ordenam: "10 anos" viria antes de "2 anos").
+	YearsExperience    *int    `json:"yearsExperience"`
+	AppliedAt          string  `json:"appliedAt"`
 	Status             string  `json:"status"`
 	Initials           string  `json:"initials"`
 	AvatarColorIndex   int     `json:"avatarColorIndex"`
@@ -142,6 +147,8 @@ func toCandidateResponse(c *Candidate) *CandidateResponse {
 		Experience:         experienceLabel(c.YearsExperience),
 		Location:           locationLabel(c.City, c.State),
 		MatchPct:           c.MatchPct,
+		YearsExperience:    c.YearsExperience,
+		AppliedAt:          c.CreatedAt.UTC().Format(time.RFC3339),
 		Status:             statusLabel(c.Status, c.PhaseKey),
 		Initials:           initials(c.Name),
 		AvatarColorIndex:   avatarColorIndex(c.ID),
