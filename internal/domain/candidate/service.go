@@ -40,6 +40,8 @@ type Service interface {
 	// Assess gera (ou devolve, se já existe para esta fase e versão do prompt) a sugestão da IA
 	// para um candidato. Só grava a avaliação — nunca decide, avança ou reprova ninguém.
 	Assess(ctx context.Context, companyID, id string) (*AIAssessment, error)
+	// RegisterManualTalent é o cadastro manual de talento — ver manual_talent.go.
+	RegisterManualTalent(ctx context.Context, companyID string, in ManualTalentInput) (string, error)
 }
 
 // duplicateApplicationMessage vai no campo e-mail: é ele que identifica a candidatura (ver
@@ -213,41 +215,95 @@ func advance(ctx context.Context, repo Repository, feed activity.Repository, com
 		return nil, apperror.Internal("falha ao registrar decisão")
 	}
 
+	// Aprovado (chegou à fase final) com consentimento entra no banco: o perfil de quem deu certo é a
+	// referência de comparação para as próximas vagas. Sem consentimento dado, não entra — a
+	// aprovação não é momento de pedir autorização a ninguém.
+	var talentIDPtr *string
+	if next.Key == PhaseSelecionados {
+		id, err := addToBank(ctx, repo, companyID, cand, OriginApproval, true)
+		if err != nil {
+			return nil, apperror.Internal("falha ao registrar talento")
+		}
+		talentIDPtr = id
+	}
+
+	message := fmt.Sprintf("%s avançou para %s.", cand.Name, phaseLabel(next.Key))
+	if talentIDPtr != nil {
+		message = fmt.Sprintf("%s avançou para %s — perfil adicionado ao Banco de Talentos.", cand.Name, phaseLabel(next.Key))
+	}
 	if err := feed.Create(ctx, &activity.Entry{
 		CompanyID: companyID, CampaignID: &cand.CampaignID,
 		Actor: activity.ActorRecruiter, ActorUserID: &decidedByUserID,
-		Message: fmt.Sprintf("%s avançou para %s.", cand.Name, phaseLabel(next.Key)),
+		Message: message,
 	}); err != nil {
 		return nil, apperror.Internal("falha ao registrar atividade")
 	}
 
-	return &DecideResult{Phase: next.Key}, nil
+	return &DecideResult{Phase: next.Key, TalentID: talentIDPtr}, nil
+}
+
+// Origens de entrada no banco (enum talent_origin).
+const (
+	OriginRejection = "reprovacao_qualificada"
+	OriginApproval  = "aprovacao"
+	OriginManual    = "cadastro_manual"
+)
+
+// addToBank põe no Banco de Talentos a pessoa por trás de um candidato e devolve o id do talento, ou
+// nil se ela não entrou.
+//
+// Sempre reaproveita o registro que a pessoa já tem — o da própria candidatura ou, na falta dele, o de
+// mesmo e-mail na empresa — em vez de criar um segundo (era assim que a mesma pessoa aparecia duas vezes
+// no banco). Só cria registro novo quando não há nenhum, e então com o perfil completo do candidato.
+//
+// requireConsent=true (aprovação): só entra quem já consentiu; nada é criado. false (reprovação com
+// envio confirmado): entra, e quem ainda não tinha consentido fica "notificado", porque é o convite que
+// está sendo enviado. Quem pediu exclusão nunca volta ao banco.
+func addToBank(ctx context.Context, repo Repository, companyID string, cand *Candidate, origin string, requireConsent bool) (*string, error) {
+	talentID := ""
+	if cand.TalentID != nil {
+		talentID = *cand.TalentID
+	} else {
+		existing, err := repo.FindTalentIDByEmail(ctx, companyID, cand.Email)
+		if err != nil {
+			return nil, err
+		}
+		talentID = existing
+	}
+	if talentID == "" {
+		if requireConsent {
+			return nil, nil
+		}
+		created, err := repo.CreateTalentFromCandidate(ctx, companyID, cand.ID, origin)
+		if err != nil {
+			return nil, err
+		}
+		talentID = created
+	}
+	inBank, err := repo.PromoteTalentToBank(ctx, companyID, talentID, origin, requireConsent)
+	if err != nil || !inBank {
+		return nil, err
+	}
+	if cand.TalentID == nil {
+		if err := repo.LinkCandidateTalent(ctx, companyID, cand.ID, talentID); err != nil {
+			return nil, err
+		}
+	}
+	return &talentID, nil
 }
 
 func reject(ctx context.Context, repo Repository, feed activity.Repository, companyID string, cand *Candidate, req DecideRequest, assessmentID *string, decidedByUserID string) (*DecideResult, error) {
 	reasonKey := *req.RejectionReasonKey
 
+	// Só entra no banco quem o motivo qualifica E o RH confirmou o envio (checkbox "Enviar ao Banco
+	// de Talentos"). Desmarcado = não entra — o banco tem só quem o RH escolheu (ver addToBank).
 	var talentIDPtr *string
-	if goesToBank[reasonKey] {
-		// sendBankInvite reflete o checkbox "Enviar convite ao Banco de Talentos" (ver
-		// candidate-profile.component.html) — é o RH decidindo mandar (ou não) o convite de
-		// consentimento pra pessoa, não a pessoa já tendo respondido. Por isso consent_state vira
-		// 'notificado' (convite enviado, aguardando resposta) quando marcado, nunca 'consentido'
-		// direto — essa transição (resposta real da pessoa) é fluxo do Banco de Talentos, que
-		// ainda não existe. Sem o convite, fica como todo cadastro qualificado sem contato:
-		// legítimo interesse, não notificado.
-		legalBasis, consentState := "legitimo_interesse", "nao_notificado"
-		if req.SendBankInvite {
-			legalBasis, consentState = "consentimento", "notificado"
-		}
-		talentID, err := repo.CreateTalentFromRejection(ctx, &TalentSeed{
-			CompanyID: companyID, Name: cand.Name, Email: cand.Email, City: cand.City, State: cand.State,
-			Origin: "reprovacao_qualificada", LegalBasis: legalBasis, ConsentState: consentState,
-		})
+	if goesToBank[reasonKey] && req.SendBankInvite {
+		talentID, err := addToBank(ctx, repo, companyID, cand, OriginRejection, false)
 		if err != nil {
 			return nil, apperror.Internal("falha ao registrar talento")
 		}
-		talentIDPtr = &talentID
+		talentIDPtr = talentID
 	}
 
 	matched, err := repo.Reject(ctx, companyID, cand.ID, reasonKey, talentIDPtr)
@@ -328,7 +384,7 @@ func (s *service) RegisterPublicApplication(ctx context.Context, campaignID stri
 	err = s.withTx(ctx, func(db database.DB) error {
 		txRepo := NewRepository(db)
 
-		talentID, err := txRepo.CreateTalentFromPublicApplication(ctx, &TalentSeed{
+		talentID, err := txRepo.UpsertTalentFromPublicApplication(ctx, &TalentSeed{
 			CompanyID: ref.CompanyID, Name: profile.Name, Email: profile.Email, Phone: profile.Phone,
 			LinkedInURL: profile.LinkedInURL, City: profile.City, State: profile.State,
 			Modality: profile.Modality, Seniority: profile.Seniority, YearsExperience: profile.YearsExperience,
@@ -369,7 +425,7 @@ func (s *service) RegisterPublicApplication(ctx context.Context, campaignID stri
 			if err := txRepo.InsertCandidateExperience(ctx, candidateID, entries); err != nil {
 				return apperror.Internal("falha ao registrar experiência")
 			}
-			if err := txRepo.InsertTalentExperience(ctx, talentID, entries); err != nil {
+			if err := txRepo.ReplaceTalentExperience(ctx, talentID, entries); err != nil {
 				return apperror.Internal("falha ao registrar experiência")
 			}
 		}
@@ -476,13 +532,25 @@ func (s *service) resolveApplicationProfile(ctx context.Context, companyID, camp
 		}, nil
 	}
 
+	profile, err := s.extractResume(ctx, companyID, campaignID, llm.Input{Text: in.ResumeText, PDFBytes: in.PDFBytes})
+	if err != nil {
+		return nil, err
+	}
+	return s.applyFormOverrides(profile, in), nil
+}
+
+// extractResume lê um currículo (texto ou PDF) e devolve o perfil estruturado, com tudo o que protege
+// custo: cache por conteúdo, teto de gasto mensal e registro de uso. É o único caminho de extração do
+// sistema — candidatura pública e cadastro manual de talento passam por aqui. campaignID vazio = fora de
+// campanha (cadastro manual).
+func (s *service) extractResume(ctx context.Context, companyID, campaignID string, raw llm.Input) (*llm.ExtractedProfile, error) {
 	if s.extractor == nil {
 		return nil, llm.ErrProviderUnavailable
 	}
 	// PreprocessInput converte PDF em texto localmente antes de qualquer provedor pago ver o
 	// arquivo — página de PDF é cobrada como imagem, o que custa múltiplos do mesmo conteúdo em
 	// texto. Só PDF escaneado (sem camada de texto) segue como bytes, e aí o modelo é o OCR.
-	input := llm.PreprocessInput(llm.Input{Text: in.ResumeText, PDFBytes: in.PDFBytes})
+	input := llm.PreprocessInput(raw)
 
 	// O mesmo documento nunca é extraído duas vezes: o que determina o resultado é o conteúdo, não
 	// quem enviou nem para qual vaga. É isto que faz o custo crescer com o número de currículos
@@ -499,7 +567,7 @@ func (s *service) resolveApplicationProfile(ctx context.Context, companyID, camp
 		s.recordUsage(ctx, companyID, campaignID, fingerprint, llm.Free(cacheProvider), llmusage.StatusCacheHit, "")
 		// Entradas gravadas antes da sanitização existir podem ter dado fora do formato.
 		llm.SanitizeProfile(profile)
-		return s.applyFormOverrides(profile, in), nil
+		return profile, nil
 	}
 
 	// Teto de gasto: checado DEPOIS do cache de propósito. Uma extração já paga anteriormente não
@@ -533,7 +601,7 @@ func (s *service) resolveApplicationProfile(ctx context.Context, companyID, camp
 	// porque o cache não gravou seria perder o dado E o dinheiro.
 	_ = s.repo.SaveExtraction(ctx, companyID, fingerprint, profile)
 
-	return s.applyFormOverrides(profile, in), nil
+	return profile, nil
 }
 
 // applyFormOverrides: nome e e-mail são sempre os do formulário, nos dois modos — nunca os que o
@@ -574,10 +642,13 @@ func (s *service) recordUsage(ctx context.Context, companyID, campaignID, finger
 	if s.usage == nil {
 		return
 	}
-	campaign := campaignID
+	var campaign *string
+	if campaignID != "" {
+		campaign = &campaignID
+	}
 	_ = s.usage.Record(ctx, &llmusage.Record{
 		CompanyID:   companyID,
-		CampaignID:  &campaign,
+		CampaignID:  campaign,
 		Operation:   llmusage.OperationExtraction,
 		Usage:       usage,
 		Status:      status,

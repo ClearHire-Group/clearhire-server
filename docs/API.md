@@ -269,7 +269,6 @@ Rota registrada e respondendo `501 não implementado` (sem lógica por trás):
 | `GET /users/:id` · `PATCH /users/:id` · `DELETE /users/:id` | perfil de RH / desativar assento |
 | `GET /candidates/:id` · `POST /candidates/:id/decisions` | candidatos e decisões manuais |
 | `POST /candidates/:id/assessment` | análise por IA (ver abaixo) |
-| `GET /talents` · `POST /talents` · `GET /talents/search` · `GET /talents/:id` | banco de talentos |
 
 `GET /campaigns` · `POST /campaigns` · `GET /campaigns/:id` ·
 `POST /campaigns/:id/toggle-pause` · `POST /campaigns/:id/public-application-link`
@@ -277,6 +276,30 @@ já estão implementados (fora desta lista) — não documentados nesta versão 
 arquivo com o mesmo detalhe de `PATCH /campaigns/:id` acima; ver
 `internal/domain/campaign/handler.go` como fonte de verdade enquanto a seção
 completa de campanhas não sobe pra "Endpoints implementados".
+
+### Banco de Talentos — `/talents`
+
+Protegido, escopado pela empresa do token. **Quem está no banco** (`talents.bank_entered_at` preenchido,
+ver `migrations/0012`) entra só por um destes caminhos — nenhum automático:
+
+| Caminho | Quando | Estado de consentimento |
+|---|---|---|
+| Reprovação qualificada (`origin: reprovacao_qualificada`) | motivo com `goesToBank` **e** `sendBankInvite: true` em `POST /candidates/:id/decisions` | mantém `consentido` de quem autorizou no formulário público; senão `notificado` (legítimo interesse) |
+| Aprovação (`origin: aprovacao`) | candidato avança até **Selecionados** e já tinha consentido | `consentido` |
+| Cadastro manual (`origin: cadastro_manual`) | `POST /talents` | `nao_notificado` até o primeiro contato |
+
+Candidatura pública cria o registro da pessoa (dados + consentimento) mas **não** a põe no banco. A mesma
+pessoa (mesmo e-mail na empresa) é sempre um registro só; quem pediu exclusão (`oposicao_exclusao`) nunca
+volta ao banco. `POST /candidates/:id/decisions` devolve `talentId` quando a decisão levou a pessoa ao banco.
+
+| Rota | Resposta |
+|---|---|
+| `GET /talents` | `Talent[]` do banco (formato de `Talent` em `clearhire-app/src/app/core/models.ts`) |
+| `GET /talents/:id` | `Talent`; `404` se não está no banco desta empresa |
+| `POST /talents` | `201 Talent`. Body `{ name, rawProfileText?, contextNote? }`; o perfil colado passa pela extração de IA (cache, teto de gasto). Erros por campo em `fields`; pessoa já registrada = `fields.rawProfileText`. Telefone e pretensão salarial do perfil colado não são guardados (perfil manual guarda só dado profissional). |
+| `POST /talents/:id/first-contact` | `Talent`; `nao_notificado` → `notificado` |
+| `GET /talents/coverage` | `[{ skillTerm, count }]` — quem pode ser chamado, por skill |
+| `GET /talents/search`, `GET /talents/:id/similar` | `501` — ainda não implementados (o front mostra vazio) |
 
 ### Erros de formulário da candidatura pública (`POST /public/campaigns/:id/applications[/resume-file]`)
 

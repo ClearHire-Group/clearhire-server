@@ -54,9 +54,24 @@ type Repository interface {
 	// junto.
 	Reject(ctx context.Context, companyID, id, reasonKey string, talentID *string) (bool, error)
 	CreateDecision(ctx context.Context, d *Decision) error
-	// CreateTalentFromRejection cria o talento mínimo (sem embedding — ver TalentSeed) e devolve o
-	// id gerado, pra Reject linkar em candidates.talent_id.
-	CreateTalentFromRejection(ctx context.Context, t *TalentSeed) (string, error)
+	// FindTalentIDByEmail acha a pessoa já registrada na empresa pelo e-mail (citext), ou "" — é a
+	// deduplicação: a mesma pessoa não vira dois talentos por ter passado por dois caminhos.
+	FindTalentIDByEmail(ctx context.Context, companyID, email string) (string, error)
+	// CreateTalentFromCandidate registra a pessoa de um candidato que ainda não tinha registro de
+	// talento (ex.: candidato inserido direto no banco), copiando TODO o perfil que a candidatura
+	// tem — contato, resumo, formação, experiência e skills —, não só nome e e-mail. Nasce fora do
+	// banco; quem o põe no banco é PromoteTalentToBank.
+	CreateTalentFromCandidate(ctx context.Context, companyID, candidateID, origin string) (string, error)
+	// PromoteTalentToBank põe o talento no Banco de Talentos (idempotente). requireConsent=true só
+	// promove quem já consentiu (caminho da aprovação); false promove como "notificado" quem ainda
+	// não tinha consentido (a reprovação envia o convite). Nunca promove quem pediu exclusão. Devolve
+	// se o talento está no banco depois da chamada.
+	PromoteTalentToBank(ctx context.Context, companyID, talentID, origin string, requireConsent bool) (bool, error)
+	// LinkCandidateTalent liga a candidatura ao registro da pessoa (é o que monta o histórico dela no
+	// banco). Só preenche quando ainda não havia vínculo.
+	LinkCandidateTalent(ctx context.Context, companyID, candidateID, talentID string) error
+	// CreateManualTalent grava o cadastro manual (fora de campanha), já dentro do banco.
+	CreateManualTalent(ctx context.Context, t *TalentSeed) (string, error)
 
 	// --- Candidatura pública (link de campanha) ---
 
@@ -73,12 +88,16 @@ type Repository interface {
 	// SaveExtraction guarda o resultado da extração paga. Idempotente: envio concorrente do mesmo
 	// currículo não pode estourar a unique — o segundo simplesmente não sobrescreve.
 	SaveExtraction(ctx context.Context, companyID, fingerprint string, profile *llm.ExtractedProfile) error
-	// CreateTalentFromPublicApplication grava o perfil rico (extraído pela IA ou preenchido
-	// manualmente) — nunca referencia embedding, mesma disciplina de CreateTalentFromRejection.
-	CreateTalentFromPublicApplication(ctx context.Context, t *TalentSeed) (string, error)
+	// UpsertTalentFromPublicApplication grava o perfil rico (extraído pela IA ou preenchido
+	// manualmente) — ou, se a pessoa já está registrada na empresa com este e-mail, ATUALIZA esse
+	// registro com os dados novos em vez de criar um segundo. Não põe ninguém no banco: a candidatura
+	// não é caminho de entrada (ver migrations/0012). Nunca referencia embedding.
+	UpsertTalentFromPublicApplication(ctx context.Context, t *TalentSeed) (string, error)
 	CreateCandidate(ctx context.Context, c *CandidateSeed) (string, error)
 	InsertCandidateExperience(ctx context.Context, candidateID string, entries []ExperienceEntry) error
-	InsertTalentExperience(ctx context.Context, talentID string, entries []ExperienceEntry) error
+	// ReplaceTalentExperience troca a experiência do talento pela recebida: numa pessoa que já
+	// existia, o currículo novo é a versão atual — acrescentar duplicaria as entradas.
+	ReplaceTalentExperience(ctx context.Context, talentID string, entries []ExperienceEntry) error
 	// ResolveSkills casa cada termo contra skills.canonical_term ∪ skill_synonyms.synonym_text
 	// (match exato, citext já é case-insensitive). O que não bate não vira ResolvedSkill — o
 	// service decide se isso vai pra fila de revisão (ver QueueSkillReview).
@@ -441,14 +460,95 @@ func (r *postgresRepository) CreateDecision(ctx context.Context, d *Decision) er
 	return err
 }
 
-func (r *postgresRepository) CreateTalentFromRejection(ctx context.Context, t *TalentSeed) (string, error) {
+func (r *postgresRepository) FindTalentIDByEmail(ctx context.Context, companyID, email string) (string, error) {
+	if email == "" {
+		return "", nil
+	}
 	var id string
-	row := r.db.QueryRow(ctx, `
-		insert into talents (company_id, name, email, city, state, origin, legal_basis, consent_state, consent_date)
-		values ($1, $2, nullif($3, ''), nullif($4, ''), nullif($5, ''), $6, $7, $8, current_date)
+	err := r.db.QueryRow(ctx, `
+		select id from talents where company_id = $1 and email = $2 and deleted_at is null
+	`, companyID, email).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	return id, err
+}
+
+func (r *postgresRepository) CreateTalentFromCandidate(ctx context.Context, companyID, candidateID, origin string) (string, error) {
+	var id string
+	err := r.db.QueryRow(ctx, `
+		insert into talents (company_id, name, email, phone, linkedin_url, city, state, years_experience, summary,
+		                     education_degree, education_institution, education_period,
+		                     origin, legal_basis, consent_state)
+		select company_id, name, email, phone, linkedin_url, city, state, years_experience, summary,
+		       education_degree, education_institution, education_period,
+		       $3::talent_origin, 'legitimo_interesse', 'nao_notificado'
+		from candidates where id = $1 and company_id = $2 and deleted_at is null
 		returning id
-	`, t.CompanyID, t.Name, t.Email, t.City, t.State, t.Origin, t.LegalBasis, t.ConsentState)
-	if err := row.Scan(&id); err != nil {
+	`, candidateID, companyID, origin).Scan(&id)
+	if err != nil {
+		return "", err
+	}
+	if _, err := r.db.Exec(ctx, `
+		insert into talent_experience_entries (talent_id, role, company, period_label, description, position)
+		select $1, role, company, period_label, description, position
+		from candidate_experience_entries where candidate_id = $2
+	`, id, candidateID); err != nil {
+		return "", err
+	}
+	if _, err := r.db.Exec(ctx, `
+		insert into talent_skills (talent_id, skill_id, level, years_experience)
+		select $1, skill_id, level, years_experience from candidate_skills where candidate_id = $2
+		on conflict (talent_id, skill_id) do nothing
+	`, id, candidateID); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+func (r *postgresRepository) PromoteTalentToBank(ctx context.Context, companyID, talentID, origin string, requireConsent bool) (bool, error) {
+	// Quem já consentiu fica como está (consentimento é o estado mais forte); quem não consentiu
+	// passa a "notificado", porque a reprovação é justamente o momento em que o convite é enviado.
+	// A origem só é gravada na PRIMEIRA entrada: ela diz por onde a pessoa entrou no banco.
+	tag, err := r.db.Exec(ctx, `
+		update talents set
+			origin          = case when bank_entered_at is null then $3::talent_origin else origin end,
+			bank_entered_at = coalesce(bank_entered_at, now()),
+			legal_basis     = case when consent_state = 'consentido' then legal_basis else 'legitimo_interesse' end,
+			consent_state   = case when consent_state = 'consentido' then consent_state else 'notificado' end
+		where id = $1 and company_id = $2 and deleted_at is null
+		  and consent_state <> 'oposicao_exclusao'
+		  and (not $4 or consent_state = 'consentido')
+	`, talentID, companyID, origin, requireConsent)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+func (r *postgresRepository) LinkCandidateTalent(ctx context.Context, companyID, candidateID, talentID string) error {
+	_, err := r.db.Exec(ctx, `
+		update candidates set talent_id = $3
+		where id = $1 and company_id = $2 and talent_id is null
+	`, candidateID, companyID, talentID)
+	return err
+}
+
+func (r *postgresRepository) CreateManualTalent(ctx context.Context, t *TalentSeed) (string, error) {
+	var id string
+	err := r.db.QueryRow(ctx, `
+		insert into talents (company_id, name, email, linkedin_url, city, state, modality, seniority,
+		                     years_experience, summary, recruiter_notes,
+		                     education_degree, education_institution, education_period,
+		                     origin, legal_basis, consent_state, bank_entered_at)
+		values ($1, $2, nullif($3, ''), nullif($4, ''), nullif($5, ''), nullif($6, ''), nullif($7, ''), nullif($8, ''),
+		        $9, nullif($10, ''), nullif($11, ''), nullif($12, ''), nullif($13, ''), nullif($14, ''),
+		        'cadastro_manual', 'legitimo_interesse', 'nao_notificado', now())
+		returning id
+	`, t.CompanyID, t.Name, t.Email, t.LinkedInURL, t.City, t.State, t.Modality, t.Seniority,
+		t.YearsExperience, t.Summary, t.RecruiterNotes,
+		t.EducationDegree, t.EducationInstitution, t.EducationPeriod).Scan(&id)
+	if err != nil {
 		return "", err
 	}
 	return id, nil
@@ -511,7 +611,10 @@ func (r *postgresRepository) SaveExtraction(ctx context.Context, companyID, fing
 	return err
 }
 
-func (r *postgresRepository) CreateTalentFromPublicApplication(ctx context.Context, t *TalentSeed) (string, error) {
+func (r *postgresRepository) UpsertTalentFromPublicApplication(ctx context.Context, t *TalentSeed) (string, error) {
+	// ON CONFLICT no índice único (empresa, e-mail) de migrations/0012. Na atualização: dado novo
+	// preenchido vence, vazio não apaga o que existia; a origem e a entrada no banco não mudam; e o
+	// consentimento é renovado — a pessoa acabou de consentir de novo, neste formulário.
 	var id string
 	row := r.db.QueryRow(ctx, `
 		insert into talents (company_id, name, email, phone, city, state, linkedin_url, modality, seniority,
@@ -522,6 +625,27 @@ func (r *postgresRepository) CreateTalentFromPublicApplication(ctx context.Conte
 		        nullif($8, ''), nullif($9, ''), $10, $11, $12, $13, nullif($14, ''),
 		        $15, $16, $17, current_date, nullif($18, ''),
 		        nullif($19, ''), nullif($20, ''), nullif($21, ''))
+		on conflict (company_id, email) where deleted_at is null and email is not null do update set
+			name                  = excluded.name,
+			phone                 = coalesce(excluded.phone, talents.phone),
+			city                  = coalesce(excluded.city, talents.city),
+			state                 = coalesce(excluded.state, talents.state),
+			linkedin_url          = coalesce(excluded.linkedin_url, talents.linkedin_url),
+			modality              = coalesce(excluded.modality, talents.modality),
+			seniority             = coalesce(excluded.seniority, talents.seniority),
+			years_experience      = coalesce(excluded.years_experience, talents.years_experience),
+			salary_min            = coalesce(excluded.salary_min, talents.salary_min),
+			salary_max            = coalesce(excluded.salary_max, talents.salary_max),
+			available_from        = coalesce(excluded.available_from, talents.available_from),
+			availability_note     = coalesce(excluded.availability_note, talents.availability_note),
+			summary               = coalesce(excluded.summary, talents.summary),
+			education_degree      = coalesce(excluded.education_degree, talents.education_degree),
+			education_institution = coalesce(excluded.education_institution, talents.education_institution),
+			education_period      = coalesce(excluded.education_period, talents.education_period),
+			legal_basis           = excluded.legal_basis,
+			consent_state         = excluded.consent_state,
+			consent_date          = excluded.consent_date,
+			profile_reviewed_at   = now()
 		returning id
 	`, t.CompanyID, t.Name, t.Email, t.Phone, t.City, t.State, t.LinkedInURL, t.Modality, t.Seniority,
 		t.YearsExperience, t.SalaryMin, t.SalaryMax, t.AvailableFrom, t.AvailabilityNote,
@@ -561,7 +685,10 @@ func (r *postgresRepository) InsertCandidateExperience(ctx context.Context, cand
 	return nil
 }
 
-func (r *postgresRepository) InsertTalentExperience(ctx context.Context, talentID string, entries []ExperienceEntry) error {
+func (r *postgresRepository) ReplaceTalentExperience(ctx context.Context, talentID string, entries []ExperienceEntry) error {
+	if _, err := r.db.Exec(ctx, `delete from talent_experience_entries where talent_id = $1`, talentID); err != nil {
+		return err
+	}
 	for i, e := range entries {
 		if _, err := r.db.Exec(ctx, `
 			insert into talent_experience_entries (talent_id, role, company, period_label, description, position)

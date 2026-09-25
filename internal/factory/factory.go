@@ -48,13 +48,15 @@ func New(db *pgxpool.Pool, cfg *config.Config) *Factory {
 	// currículo e avalia candidato). Quem decide o provedor é LLM_PROVIDER — ver newLLM.
 	extractor, assessor := newLLM(cfg)
 
+	candidateHandler, candidateService := InitCandidateFactory(db, extractor, assessor)
+
 	return &Factory{
 		AuthHandler:      InitAuthFactory(db, userRepo, cfg.JWTSecret, !isDevelopment, isDevelopment, frontendBaseURL, sender),
 		CompanyHandler:   InitCompanyFactory(db, userRepo),
 		UserHandler:      InitUserFactory(userRepo, sender, frontendBaseURL, isDevelopment),
 		CampaignHandler:  InitCampaignFactory(db),
-		CandidateHandler: InitCandidateFactory(db, extractor, assessor),
-		TalentHandler:    InitTalentFactory(db),
+		CandidateHandler: candidateHandler,
+		TalentHandler:    InitTalentFactory(db, candidateService),
 		DashboardHandler: InitDashboardFactory(db),
 		ActivityHandler:  InitActivityFactory(db),
 	}

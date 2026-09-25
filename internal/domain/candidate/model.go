@@ -143,6 +143,7 @@ type TalentSeed struct {
 	Origin                                                 string
 	LegalBasis                                             string
 	ConsentState                                           string
+	RecruiterNotes                                         string
 }
 
 // CandidateSeed é o que se grava em candidates numa candidatura pública — phase_key/status ficam

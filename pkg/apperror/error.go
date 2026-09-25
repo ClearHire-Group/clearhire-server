@@ -11,6 +11,8 @@ type AppError struct {
 	// Field é o campo do formulário a que o erro se refere ("email"), quando há um. O handler o
 	// devolve em Envelope.Fields para o front mostrar a mensagem no campo certo.
 	Field string
+	// Fields é o erro de cada campo de um formulário inteiro inválido (campo -> mensagem).
+	Fields map[string]string
 }
 
 func (e *AppError) Error() string {
@@ -28,6 +30,11 @@ func BadRequest(message string) *AppError {
 // BadRequestField é BadRequest ligado a um campo do formulário.
 func BadRequestField(field, message string) *AppError {
 	return &AppError{Code: http.StatusBadRequest, Message: message, Field: field}
+}
+
+// Validation é o formulário com um ou mais campos inválidos.
+func Validation(message string, fields map[string]string) *AppError {
+	return &AppError{Code: http.StatusBadRequest, Message: message, Fields: fields}
 }
 
 func Unauthorized(message string) *AppError {

@@ -243,6 +243,9 @@ func readResumePDF(c *fiber.Ctx) ([]byte, string) {
 func (h *Handler) respondError(c *fiber.Ctx, err error) error {
 	var appErr *apperror.AppError
 	if errors.As(err, &appErr) {
+		if len(appErr.Fields) > 0 {
+			return response.ErrFields(c, appErr.Code, appErr.Message, appErr.Fields)
+		}
 		if appErr.Field != "" {
 			return response.ErrFields(c, appErr.Code, appErr.Message, map[string]string{appErr.Field: appErr.Message})
 		}
