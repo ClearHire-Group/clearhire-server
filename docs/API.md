@@ -268,6 +268,7 @@ Rota registrada e respondendo `501 não implementado` (sem lógica por trás):
 | `POST /auth/invitations/:token/accept` | segundo RH aceita convite e define senha |
 | `GET /users/:id` · `PATCH /users/:id` · `DELETE /users/:id` | perfil de RH / desativar assento |
 | `GET /candidates/:id` · `POST /candidates/:id/decisions` | candidatos e decisões manuais |
+| `POST /candidates/:id/assessment` | análise por IA (ver abaixo) |
 | `GET /talents` · `POST /talents` · `GET /talents/search` · `GET /talents/:id` | banco de talentos |
 
 `GET /campaigns` · `POST /campaigns` · `GET /campaigns/:id` ·
@@ -276,6 +277,53 @@ já estão implementados (fora desta lista) — não documentados nesta versão 
 arquivo com o mesmo detalhe de `PATCH /campaigns/:id` acima; ver
 `internal/domain/campaign/handler.go` como fonte de verdade enquanto a seção
 completa de campanhas não sobe pra "Endpoints implementados".
+
+### Erros de formulário da candidatura pública (`POST /public/campaigns/:id/applications[/resume-file]`)
+
+Formulário inválido responde `400` com o erro **por campo** em `fields`, para o front mostrar cada
+mensagem no próprio campo. As regras estão em `internal/domain/candidate/application_validation.go`,
+espelhadas em `clearhire-app/src/app/core/application-validation.ts`.
+
+```json
+{ "success": false, "error": "Revise os campos destacados.",
+  "fields": { "email": "Confira o e-mail: você quis dizer pedro@gmail.com?", "phone": "Use apenas números no telefone, ex.: (61) 99999-9999." } }
+```
+
+Chaves possíveis: `name`, `email`, `phone`, `linkedinUrl`, `city`, `state`, `yearsExperience`, `summary`,
+`educationDegree`, `educationInstitution`, `educationPeriod`, `skills`, `resumeText`, `file`, `consent`.
+Candidatura duplicada também vem como `fields.email`. Valores válidos são gravados normalizados:
+telefone `(61) 99902-3060`, LinkedIn `https://www.linkedin.com/in/<perfil>`, estado como UF, e-mail em
+minúsculas, skills sem repetição. O texto de currículo colado vai de 100 a 14.000 caracteres.
+
+### `POST /candidates/:id/assessment` — análise por IA (sugestão)
+
+Protegido, escopado pela empresa do token (candidato de outra empresa = `404`). Gera a sugestão da IA
+para o candidato **na fase em que ele está** e a grava; também é disparada automaticamente, em
+background, depois de toda candidatura pública. **Só sugere**: nunca move de fase, decide ou reprova
+ninguém (`POST /candidates/:id/decisions` continua sendo o único caminho de decisão, manual).
+
+Idempotente por (candidato, fase, versão do prompt): pedir de novo devolve a análise existente sem
+nova chamada ao provedor nem novo custo. Ao avançar de fase, uma nova análise pode ser pedida.
+
+**Resposta — `200 OK`** (mesmo objeto de `ai` em `GET /candidates/:id`)
+```json
+{ "success": true, "data": {
+  "matchPct": 82, "matchLabel": "Bom match", "matchNote": "Forte em backend.",
+  "strengths": ["Python avançado, 6 anos"], "concerns": ["Sem experiência declarada com Kubernetes"],
+  "justification": "Seis anos de Python e pipelines de dados batem com os requisitos."
+} }
+```
+
+| Status | Quando |
+|---|---|
+| `400` | candidato já com decisão final (reprovado/contratado), ou teto mensal de IA da empresa atingido |
+| `404` | candidato não existe ou é de outra empresa |
+| `429` | mais de 20 pedidos/min do mesmo usuário |
+| `503` | IA não habilitada neste ambiente (`LLM_PROVIDER` ≠ `groq`) ou provedor indisponível/limitado — tente de novo |
+
+**Mudança de contrato:** `GET /candidates/:id` agora devolve `"ai": null` enquanto o candidato não foi
+avaliado (antes era um objeto zerado, exibido como "0%"). O que a IA enxerga: dados da vaga e o perfil
+estruturado do candidato — **sem** nome, e-mail, telefone ou LinkedIn.
 
 Todos exigem token exceto onde marcado público acima. Conforme cada um saia
 do esqueleto, a seção dele sobe pra "Endpoints implementados" com o mesmo

@@ -165,7 +165,9 @@ type CandidateProfileResponse struct {
 	Experience      []experienceEntryResponse `json:"experience"`
 	Education       candidateEducation        `json:"education"`
 	Skills          []string                  `json:"skills"`
-	AI              candidateAIResponse       `json:"ai"`
+	// AI é null enquanto o candidato não foi avaliado. Antes era um objeto zerado, o que a tela
+	// mostrava como "0%" — indistinguível de uma avaliação real com nota baixa.
+	AI *candidateAIResponse `json:"ai"`
 }
 
 type candidateContact struct {
@@ -194,6 +196,29 @@ type candidateAIResponse struct {
 	Strengths     []string `json:"strengths"`
 	Concerns      []string `json:"concerns"`
 	Justification string   `json:"justification"`
+}
+
+func toAIResponse(a *AIAssessment) *candidateAIResponse {
+	if a == nil {
+		return nil
+	}
+	return &candidateAIResponse{
+		MatchPct:      a.MatchPct,
+		MatchLabel:    a.MatchLabel,
+		MatchNote:     a.MatchNote,
+		Strengths:     a.Strengths,
+		Concerns:      a.Concerns,
+		Justification: a.Justification,
+	}
+}
+
+// ResumeFileForm são os campos de texto do upload de currículo (multipart). O modo PDF não passa
+// pelo BodyParser/JSON, então sem esta struct nome e e-mail entrariam sem nenhuma validação. As
+// regras são as mesmas do JSON — ver normalizeAndValidate em application_validation.go.
+type ResumeFileForm struct {
+	Name    string
+	Email   string
+	Consent bool
 }
 
 // DecideResponse é o que POST /candidates/:id/decisions devolve — só o que o frontend
@@ -225,17 +250,7 @@ func toCandidateProfileResponse(d *CandidateDetail) *CandidateProfileResponse {
 		experience[i] = experienceEntryResponse{Role: e.Role, Company: e.Company, Period: e.PeriodLabel, Description: e.Description}
 	}
 
-	ai := candidateAIResponse{Strengths: []string{}, Concerns: []string{}}
-	if d.AI != nil {
-		ai = candidateAIResponse{
-			MatchPct:      d.AI.MatchPct,
-			MatchLabel:    d.AI.MatchLabel,
-			MatchNote:     d.AI.MatchNote,
-			Strengths:     d.AI.Strengths,
-			Concerns:      d.AI.Concerns,
-			Justification: d.AI.Justification,
-		}
-	}
+	ai := toAIResponse(d.AI)
 
 	return &CandidateProfileResponse{
 		CandidateID:     d.ID,

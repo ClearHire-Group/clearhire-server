@@ -29,31 +29,33 @@ type SubmitApplicationRequest struct {
 	// Name e Email são sempre exigidos, nos dois modos — nome não é algo que dá pra extrair de
 	// forma confiável só com reconhecimento de padrão (ver pkg/llm/deterministic), e
 	// consentimento/contato não pode depender só de o texto ter sido lido certo.
-	Name  string `json:"name" validate:"required,max=200"`
-	Email string `json:"email" validate:"required,email,max=254"`
+	//
+	// Os campos de pessoa não têm tag `validate`: as regras deles (formato, tamanho, normalização)
+	// ficam em normalizeAndValidate (application_validation.go), que devolve o erro POR CAMPO para o
+	// formulário — uma tag falhando só produziria o "dados inválidos" genérico, sem dizer qual.
+	Name  string `json:"name"`
+	Email string `json:"email"`
 
 	// Modo manual — o caminho mais confiável, porque não depende do reconhecimento de padrão ter
 	// identificado tudo certo.
-	Phone                string                 `json:"phone" validate:"omitempty,max=30"`
-	LinkedInURL          string                 `json:"linkedinUrl" validate:"omitempty,max=500"`
-	City                 string                 `json:"city" validate:"omitempty,max=100"`
-	State                string                 `json:"state" validate:"omitempty,max=100"`
-	YearsExperience      *int                   `json:"yearsExperience" validate:"omitempty,min=0,max=60"`
-	Summary              string                 `json:"summary" validate:"omitempty,max=4000"`
-	EducationDegree      string                 `json:"educationDegree" validate:"omitempty,max=200"`
-	EducationInstitution string                 `json:"educationInstitution" validate:"omitempty,max=200"`
-	EducationPeriod      string                 `json:"educationPeriod" validate:"omitempty,max=100"`
+	Phone                string                 `json:"phone"`
+	LinkedInURL          string                 `json:"linkedinUrl"`
+	City                 string                 `json:"city"`
+	State                string                 `json:"state"`
+	YearsExperience      *int                   `json:"yearsExperience"`
+	Summary              string                 `json:"summary"`
+	EducationDegree      string                 `json:"educationDegree"`
+	EducationInstitution string                 `json:"educationInstitution"`
+	EducationPeriod      string                 `json:"educationPeriod"`
 	Experience           []ExperienceEntryInput `json:"experience" validate:"omitempty,max=20,dive"`
-	Skills               []string               `json:"skills" validate:"omitempty,max=40,dive,max=100"`
+	Skills               []string               `json:"skills"`
 
 	// Modo currículo colado — a IA lê e extrai.
-	ResumeText string `json:"resumeText" validate:"omitempty,max=20000"`
+	ResumeText string `json:"resumeText"`
 
-	// Comuns aos dois modos.
-	// Consent tem que vir true — checado explicitamente no service (booleano "required" do
-	// go-playground/validator só recusa o zero-value, o que já cobre false, mas o service confere
-	// de novo por clareza).
-	Consent bool `json:"consent" validate:"required"`
+	// Comuns aos dois modos. Consent tem que vir true (conferido em normalizeAndValidate e de novo
+	// no service).
+	Consent bool `json:"consent"`
 	// Honeypot: campo que um formulário de verdade nunca preenche — só um bot preenchendo tudo
 	// automaticamente cai aqui. `max=0` faz qualquer valor não vazio já falhar a validação.
 	Honeypot string `json:"website" validate:"omitempty,max=0"`
@@ -74,7 +76,7 @@ func (r SubmitApplicationRequest) toInput() (PublicApplicationInput, error) {
 		}
 	case "resume_text":
 		if r.ResumeText == "" {
-			return base, apperror.BadRequest("cole o texto do currículo")
+			return base, apperror.BadRequestField("resumeText", "Cole o texto do seu currículo.")
 		}
 		base.ResumeText = r.ResumeText
 	}

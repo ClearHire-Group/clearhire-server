@@ -3,11 +3,10 @@
 // devolve o texto bruto pro resto do pipeline casar skills contra a taxonomia já cadastrada (ver
 // candidate.Repository.FindSkillMentionsInText — dicionário, não IA).
 //
-// Existe porque a extração via IA custa por chamada de API (cobrança à parte de qualquer
-// assinatura de uso do Claude Code) e a decisão de produto, pelo menos pro MVP, foi não depender
-// desse custo. pkg/llm/anthropicadapter continua existindo, intocado, pronto pra ligar de volta —
-// trocar essa implementação pela outra é uma linha só em internal/factory/factory.go, porque as
-// duas implementam a mesma interface llm.Extractor.
+// Existe porque a extração via IA custa por chamada de API e a decisão de produto, pelo menos pro
+// MVP, foi não depender desse custo: é o provedor PADRÃO (LLM_PROVIDER=deterministic). Trocar para
+// pkg/llm/groqadapter ou pkg/llm/anthropicadapter é só configuração (LLM_PROVIDER + chave), porque
+// todos implementam a mesma interface llm.Extractor.
 //
 // Limitação real, de propósito: nome da pessoa, experiência profissional estruturada e formação
 // não são coisas que dá pra extrair de forma confiável só com regex — por isso o formulário de
@@ -16,12 +15,9 @@
 package deterministic
 
 import (
-	"bytes"
 	"context"
 	"regexp"
 	"strings"
-
-	"github.com/ledongthuc/pdf"
 
 	"github.com/ClearHire-Group/clearhire-server/pkg/llm"
 )
@@ -40,17 +36,23 @@ func New() llm.Extractor {
 	return &extractor{}
 }
 
-func (e *extractor) Extract(_ context.Context, in llm.Input) (*llm.ExtractedProfile, error) {
+// ProviderName identifica este caminho em llm_usage. Linhas com este provedor e zero tokens são
+// gratuitas de verdade — não é contabilidade faltando.
+const ProviderName = "deterministic"
+
+func (e *extractor) Extract(_ context.Context, in llm.Input) (*llm.ExtractedProfile, llm.Usage, error) {
+	usage := llm.Free(ProviderName)
+
 	text := in.Text
 	if len(in.PDFBytes) > 0 {
-		extracted, err := extractPDFText(in.PDFBytes)
+		extracted, err := llm.ExtractPDFText(in.PDFBytes)
 		if err != nil {
-			return nil, llm.ErrMalformedOutput
+			return nil, usage, llm.ErrMalformedOutput
 		}
 		text = extracted
 	}
 	if strings.TrimSpace(text) == "" {
-		return nil, llm.ErrMalformedOutput
+		return nil, usage, llm.ErrMalformedOutput
 	}
 
 	profile := &llm.ExtractedProfile{RawText: text}
@@ -66,25 +68,5 @@ func (e *extractor) Extract(_ context.Context, in llm.Input) (*llm.ExtractedProf
 	// Skills ficam de fora aqui de propósito — sem acesso ao banco, este pacote não sabe qual é a
 	// taxonomia cadastrada. candidate.Service resolve isso depois, direto do RawText (ver
 	// FindSkillMentionsInText), não a partir de ExtractedProfile.Skills.
-	return profile, nil
-}
-
-// extractPDFText lê os bytes em memória (nunca grava em disco — o handler HTTP também não grava,
-// ver candidate/handler.go) e devolve o texto puro da camada de texto do PDF. Não é OCR: um PDF
-// escaneado como imagem, sem texto selecionável, devolve string vazia — mesma limitação de
-// qualquer extrator de texto de PDF sem visão computacional.
-func extractPDFText(data []byte) (string, error) {
-	r, err := pdf.NewReader(bytes.NewReader(data), int64(len(data)))
-	if err != nil {
-		return "", err
-	}
-	reader, err := r.GetPlainText()
-	if err != nil {
-		return "", err
-	}
-	var buf bytes.Buffer
-	if _, err := buf.ReadFrom(reader); err != nil {
-		return "", err
-	}
-	return buf.String(), nil
+	return profile, usage, nil
 }

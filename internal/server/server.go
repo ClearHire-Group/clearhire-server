@@ -4,6 +4,8 @@
 package server
 
 import (
+	"time"
+
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/helmet"
@@ -23,6 +25,22 @@ func New(cfg *config.Config) *fiber.App {
 		// próprio de 5MB, ver candidate/handler.go) sem deixar passar coisa absurdamente grande —
 		// bem abaixo do limite de 32MB da API da Claude.
 		BodyLimit: 6 * 1024 * 1024,
+		// Sem timeouts o Fiber espera para sempre: uma conexão que manda 1 byte por vez (slowloris)
+		// ocuparia um worker indefinidamente. O ReadTimeout cobre o upload de currículo (até 5MB);
+		// o WriteTimeout tem que ficar ACIMA do teto total de uma chamada de IA (llm.Limits, 40s) —
+		// senão o servidor cortaria a resposta de uma candidatura que a IA ainda está processando.
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 60 * time.Second,
+		IdleTimeout:  120 * time.Second,
+		// c.IP() alimenta o rate limit por IP. Atrás de um proxy, sem isto todos os clientes
+		// aparecem com o IP do proxy (um balde só para o mundo); confiando em qualquer header, o
+		// cliente escolhe o próprio IP. Então: só se lê o header de IP quando a conexão vem de um
+		// proxy da lista, e o valor precisa ser um IP válido (senão o Fiber devolve o string bruto,
+		// e cada valor inventado viraria um balde novo).
+		ProxyHeader:             cfg.ClientIPHeader,
+		EnableTrustedProxyCheck: true,
+		TrustedProxies:          cfg.TrustedProxies,
+		EnableIPValidation:      true,
 	})
 
 	app.Use(recover.New())

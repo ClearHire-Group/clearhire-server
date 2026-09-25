@@ -4,9 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/ClearHire-Group/clearhire-server/internal/database"
 	"github.com/ClearHire-Group/clearhire-server/internal/domain/activity"
+	"github.com/ClearHire-Group/clearhire-server/internal/domain/llmusage"
 	"github.com/ClearHire-Group/clearhire-server/pkg/apperror"
 	"github.com/ClearHire-Group/clearhire-server/pkg/llm"
 )
@@ -31,16 +37,50 @@ type Service interface {
 	// tenant nenhum (companyID vem da própria campanha, nunca de quem chama). Cria talent+candidate
 	// juntos numa única transação, igual Decide já faz pra talent+candidate_decisions.
 	RegisterPublicApplication(ctx context.Context, campaignID string, in PublicApplicationInput) error
+	// Assess gera (ou devolve, se já existe para esta fase e versão do prompt) a sugestão da IA
+	// para um candidato. Só grava a avaliação — nunca decide, avança ou reprova ninguém.
+	Assess(ctx context.Context, companyID, id string) (*AIAssessment, error)
 }
+
+// duplicateApplicationMessage vai no campo e-mail: é ele que identifica a candidatura (ver
+// applyFormOverrides), então é ele que a pessoa precisa conferir.
+const duplicateApplicationMessage = "Você já se candidatou a esta vaga com este e-mail."
+
+// cacheProvider é o "provedor" registrado quando uma extração foi servida do cache — nenhuma
+// chamada externa aconteceu, e é isso que a linha em llm_usage documenta.
+const cacheProvider = "cache"
+
+// budgetProvider marca, em llm_usage, a chamada que o teto de gasto IMPEDIU de acontecer. Sem esta
+// linha, estourar o orçamento seria silencioso: o gasto simplesmente pararia de crescer e não
+// haveria como distinguir "ninguém se candidatou" de "recusamos todo mundo".
+const budgetProvider = "budget"
+
+// autoAssessTimeout é o teto da avaliação automática disparada depois de uma candidatura pública.
+// Roda fora do request (o candidato não espera pela triagem interna), então precisa de um teto
+// próprio — o do request já terá acabado.
+const autoAssessTimeout = 60 * time.Second
 
 type service struct {
 	repo      Repository
 	withTx    func(ctx context.Context, fn func(db database.DB) error) error
 	extractor llm.Extractor
+	// assessor é nil quando o provedor configurado não avalia (deterministic, anthropic) — a
+	// avaliação por IA simplesmente não existe naquele ambiente, e o service diz isso claramente.
+	assessor llm.Assessor
+	usage    llmusage.Repository
+
+	// assessFlight junta avaliações simultâneas do MESMO candidato/fase (duplo clique) numa chamada
+	// só, em vez de pagar duas. Entre instâncias quem garante não haver duplicata é o índice único.
+	assessFlight singleflight.Group
+	// spawn roda a avaliação automática; go func em produção, síncrono nos testes.
+	spawn func(fn func())
+	// txRepo constrói o repositório sobre a transação; é NewRepository em produção.
+	txRepo func(db database.DB) Repository
 }
 
-func NewService(repo Repository, withTx func(ctx context.Context, fn func(db database.DB) error) error, extractor llm.Extractor) Service {
-	return &service{repo: repo, withTx: withTx, extractor: extractor}
+func NewService(repo Repository, withTx func(ctx context.Context, fn func(db database.DB) error) error, extractor llm.Extractor, assessor llm.Assessor, usage llmusage.Repository) Service {
+	return &service{repo: repo, withTx: withTx, extractor: extractor, assessor: assessor, usage: usage,
+		spawn: func(fn func()) { go fn() }, txRepo: NewRepository}
 }
 
 func (s *service) Get(ctx context.Context, companyID, id string) (*CandidateDetail, error) {
@@ -242,7 +282,7 @@ func reject(ctx context.Context, repo Repository, feed activity.Repository, comp
 
 func (s *service) RegisterPublicApplication(ctx context.Context, campaignID string, in PublicApplicationInput) error {
 	if !in.Consent {
-		return apperror.BadRequest("é necessário autorizar o uso dos seus dados para se candidatar")
+		return apperror.BadRequestField("consent", consentRequiredMessage)
 	}
 	// Honeypot preenchido = bot. Resposta de sucesso falsa — não avisa que foi pego, não grava nada.
 	if in.Honeypot != "" {
@@ -264,23 +304,28 @@ func (s *service) RegisterPublicApplication(ctx context.Context, campaignID stri
 		return apperror.BadRequest("nome é obrigatório")
 	}
 
-	profile, err := s.resolveApplicationProfile(ctx, in)
-	if err != nil {
-		return mapExtractionError(err)
-	}
-	if profile.Email == "" {
-		return apperror.BadRequest("e-mail é obrigatório")
-	}
-
-	dup, err := s.repo.FindExistingApplication(ctx, campaignID, profile.Email)
+	// Dedup ANTES da extração. O formulário sempre exige e-mail nos dois modos (ver
+	// SubmitApplicationRequest), então o reenvio mais comum — a mesma pessoa mandando o mesmo
+	// formulário de novo — é barrado sem pagar inferência nenhuma. Até esta checagem existir, cada
+	// reenvio pagava a extração inteira só pra receber o mesmo 400 no final.
+	dup, err := s.repo.FindExistingApplication(ctx, campaignID, in.Email)
 	if err != nil {
 		return apperror.Internal("falha ao verificar candidatura")
 	}
 	if dup {
-		return apperror.BadRequest("você já se candidatou a esta vaga")
+		return apperror.BadRequestField("email", duplicateApplicationMessage)
 	}
 
-	return s.withTx(ctx, func(db database.DB) error {
+	profile, err := s.resolveApplicationProfile(ctx, ref.CompanyID, campaignID, in)
+	if err != nil {
+		return mapExtractionError(err)
+	}
+
+	// Nome e e-mail são SEMPRE os do formulário (ver applyFormOverrides), então o e-mail que chega
+	// aqui é o mesmo que a checagem de duplicidade acima já conferiu — não há segunda checagem.
+
+	var candidateID string
+	err = s.withTx(ctx, func(db database.DB) error {
 		txRepo := NewRepository(db)
 
 		talentID, err := txRepo.CreateTalentFromPublicApplication(ctx, &TalentSeed{
@@ -301,7 +346,7 @@ func (s *service) RegisterPublicApplication(ctx context.Context, campaignID stri
 			return apperror.Internal("falha ao registrar talento")
 		}
 
-		candidateID, err := txRepo.CreateCandidate(ctx, &CandidateSeed{
+		createdID, err := txRepo.CreateCandidate(ctx, &CandidateSeed{
 			CompanyID: ref.CompanyID, CampaignID: campaignID, TalentID: talentID,
 			Name: profile.Name, Email: profile.Email, Phone: profile.Phone, LinkedInURL: profile.LinkedInURL,
 			City: profile.City, State: profile.State, YearsExperience: profile.YearsExperience,
@@ -309,8 +354,15 @@ func (s *service) RegisterPublicApplication(ctx context.Context, campaignID stri
 			EducationInstitution: profile.EducationInstitution, EducationPeriod: profile.EducationPeriod,
 		})
 		if err != nil {
+			// A corrida entre dois envios simultâneos que passaram pela checagem de duplicidade é
+			// fechada pelo índice único (migrations/0010): quem perde recebe a mesma resposta de
+			// quem foi barrado pela checagem, não um erro interno.
+			if isUniqueViolation(err) {
+				return apperror.BadRequestField("email", duplicateApplicationMessage)
+			}
 			return apperror.Internal("falha ao registrar candidatura")
 		}
+		candidateID = createdID
 
 		if len(profile.Experience) > 0 {
 			entries := toCandidateExperience(profile.Experience)
@@ -322,28 +374,11 @@ func (s *service) RegisterPublicApplication(ctx context.Context, campaignID stri
 			}
 		}
 
-		// Duas formas de achar skill, dependendo de onde o perfil veio: modo manual dá termos
-		// soltos digitados pela pessoa (precisa casar contra a taxonomia, termo que não bate vai
-		// pra fila de revisão); modo currículo (texto/PDF) não tem lista nenhuma — é um dicionário
-		// escaneando o texto bruto por qualquer termo/sinônimo já cadastrado (determinístico, sem
-		// "quase-match", por isso não gera fila de revisão aqui).
-		var resolved []ResolvedSkill
-		if in.Manual != nil {
-			var unmapped []llm.SkillMention
-			resolved, unmapped, err = txRepo.ResolveSkills(ctx, profile.Skills)
-			if err != nil {
-				return apperror.Internal("falha ao resolver skills")
-			}
-			for _, u := range unmapped {
-				// Melhor esforço — um termo que a fila de revisão não conseguiu gravar não pode
-				// derrubar a candidatura inteira.
-				_ = txRepo.QueueSkillReview(ctx, ref.CompanyID, u.Term)
-			}
-		} else if profile.RawText != "" {
-			resolved, err = txRepo.FindSkillMentionsInText(ctx, profile.RawText)
-			if err != nil {
-				return apperror.Internal("falha ao identificar skills")
-			}
+		// Skills: lista do perfil (manual ou extraída por IA) + varredura do texto pelo dicionário da
+		// taxonomia — ver resolveProfileSkills.
+		resolved, err := resolveProfileSkills(ctx, txRepo, ref.CompanyID, profile)
+		if err != nil {
+			return apperror.Internal("falha ao resolver skills")
 		}
 		if len(resolved) > 0 {
 			if err := txRepo.InsertCandidateSkills(ctx, candidateID, resolved); err != nil {
@@ -382,12 +417,47 @@ func (s *service) RegisterPublicApplication(ctx context.Context, campaignID stri
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+
+	s.autoAssess(ref.CompanyID, candidateID)
+	return nil
+}
+
+// autoAssess dispara a avaliação de IA de uma candidatura recém-registrada, FORA do request: o
+// candidato não espera pela triagem interna. Melhor esforço — falhar (provedor fora, teto de gasto,
+// limite de taxa) nunca desfaz a candidatura; o candidato só fica em "aguardando análise da IA" e o
+// recrutador pode pedir a análise depois (POST /candidates/:id/assessment).
+func (s *service) autoAssess(companyID, candidateID string) {
+	if s.assessor == nil || candidateID == "" {
+		return
+	}
+	s.spawn(func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("avaliação automática: pânico ao avaliar candidato %s: %v", candidateID, r)
+			}
+		}()
+		// Contexto próprio: o do request já terá terminado (e o do Fiber é reciclado após o handler).
+		ctx, cancel := context.WithTimeout(context.Background(), autoAssessTimeout)
+		defer cancel()
+		if _, err := s.Assess(ctx, companyID, candidateID); err != nil {
+			log.Printf("avaliação automática do candidato %s não concluída: %v", candidateID, err)
+		}
+	})
+}
+
+// isUniqueViolation reconhece a violação de unicidade do Postgres (SQLSTATE 23505).
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
 // resolveApplicationProfile mapeia o modo manual direto (sem IA nenhuma — é o caminho mais
 // confiável, ver ManualApplicationFields) ou chama o Extractor pro modo currículo (texto colado ou
 // PDF). Exatamente um dos dois roda por chamada.
-func (s *service) resolveApplicationProfile(ctx context.Context, in PublicApplicationInput) (*llm.ExtractedProfile, error) {
+func (s *service) resolveApplicationProfile(ctx context.Context, companyID, campaignID string, in PublicApplicationInput) (*llm.ExtractedProfile, error) {
 	if in.Manual != nil {
 		m := in.Manual
 		skills := make([]llm.SkillMention, len(m.Skills))
@@ -409,19 +479,111 @@ func (s *service) resolveApplicationProfile(ctx context.Context, in PublicApplic
 	if s.extractor == nil {
 		return nil, llm.ErrProviderUnavailable
 	}
-	profile, err := s.extractor.Extract(ctx, llm.Input{Text: in.ResumeText, PDFBytes: in.PDFBytes})
+	// PreprocessInput converte PDF em texto localmente antes de qualquer provedor pago ver o
+	// arquivo — página de PDF é cobrada como imagem, o que custa múltiplos do mesmo conteúdo em
+	// texto. Só PDF escaneado (sem camada de texto) segue como bytes, e aí o modelo é o OCR.
+	input := llm.PreprocessInput(llm.Input{Text: in.ResumeText, PDFBytes: in.PDFBytes})
+
+	// O mesmo documento nunca é extraído duas vezes: o que determina o resultado é o conteúdo, não
+	// quem enviou nem para qual vaga. É isto que faz o custo crescer com o número de currículos
+	// distintos, e não com o número de envios (ver migrations/0007).
+	fingerprint := llm.Fingerprint(input)
+	profile, err := s.repo.FindCachedExtraction(ctx, companyID, fingerprint)
 	if err != nil {
+		return nil, apperror.Internal("falha ao consultar extração")
+	}
+
+	if profile != nil {
+		// Chamada que não aconteceu também é informação: é assim que dá pra medir quanto o cache
+		// está economizando, em vez de só supor.
+		s.recordUsage(ctx, companyID, campaignID, fingerprint, llm.Free(cacheProvider), llmusage.StatusCacheHit, "")
+		// Entradas gravadas antes da sanitização existir podem ter dado fora do formato.
+		llm.SanitizeProfile(profile)
+		return s.applyFormOverrides(profile, in), nil
+	}
+
+	// Teto de gasto: checado DEPOIS do cache de propósito. Uma extração já paga anteriormente não
+	// gera chamada nova, então continuar servindo do cache mesmo com o orçamento estourado é
+	// gratuito — bloquear ali puniria a empresa sem economizar um centavo.
+	if err := s.checkBudget(ctx, companyID); err != nil {
+		s.recordUsage(ctx, companyID, campaignID, fingerprint, llm.Free(budgetProvider), llmusage.StatusFailed, err.Error())
 		return nil, err
 	}
-	// Nome e e-mail são sempre exigidos no formulário (ver DTOs), nos dois modos — nunca dependem
-	// de o extrator ter reconhecido certo (o determinístico nem tenta reconhecer nome, ver
-	// pkg/llm/deterministic; mesmo se um extrator futuro tentasse, o dado que a própria pessoa
-	// digitou é sempre mais confiável).
-	profile.Name = in.Name
-	if profile.Email == "" {
-		profile.Email = in.Email
+
+	profile, usage, err := s.extractor.Extract(ctx, input)
+	if err != nil {
+		// Registrado ANTES de propagar o erro. Se a resposta chegou e era inútil (truncada,
+		// recusada), os tokens já foram cobrados — é exatamente o gasto que mais fácil some da
+		// contabilidade, porque termina em erro para o usuário.
+		status := llmusage.StatusFailed
+		if usage.InputTokens > 0 || usage.OutputTokens > 0 {
+			status = llmusage.StatusBilledError
+		}
+		s.recordUsage(ctx, companyID, campaignID, fingerprint, usage, status, err.Error())
+		return nil, err
 	}
-	return profile, nil
+	s.recordUsage(ctx, companyID, campaignID, fingerprint, usage, llmusage.StatusSuccess, "")
+
+	// A saída do modelo é entrada não confiável: valida formato e tamanho ANTES de qualquer uso e
+	// antes de ir para o cache — uma data malformada, por exemplo, faria o INSERT da candidatura
+	// falhar depois de a extração já ter sido paga.
+	llm.SanitizeProfile(profile)
+
+	// Melhor esforço: já pagamos pela extração e o perfil está em mãos — falhar a candidatura
+	// porque o cache não gravou seria perder o dado E o dinheiro.
+	_ = s.repo.SaveExtraction(ctx, companyID, fingerprint, profile)
+
+	return s.applyFormOverrides(profile, in), nil
+}
+
+// applyFormOverrides: nome e e-mail são sempre os do formulário, nos dois modos — nunca os que o
+// extrator achou. O dado que a própria pessoa digitou é mais confiável, e principalmente é a
+// IDENTIDADE da candidatura: um currículo que contenha o e-mail de outra pessoa não pode registrar a
+// candidatura em nome dela nem, via checagem de duplicidade, bloquear a candidatura verdadeira dela
+// a esta vaga. O e-mail que o currículo traz é descartado. Extraído para função porque o perfil pode
+// vir do extrator OU do cache, e esquecer de aplicar num dos caminhos devolveria a identidade errada.
+func (s *service) applyFormOverrides(profile *llm.ExtractedProfile, in PublicApplicationInput) *llm.ExtractedProfile {
+	profile.Name = in.Name
+	profile.Email = in.Email
+	return profile
+}
+
+// checkBudget é o único ponto que decide se uma chamada paga pode acontecer.
+//
+// Falha ao CONSULTAR o orçamento libera a chamada (fail-open), decisão deliberada: o custo de deixar
+// passar algumas extrações durante uma instabilidade de banco é de centavos, enquanto recusar toda
+// candidatura da plataforma pelo mesmo motivo é perder candidato real. O teto protege contra abuso
+// sustentado, não contra o minuto em que o Postgres piscou.
+func (s *service) checkBudget(ctx context.Context, companyID string) error {
+	if s.usage == nil {
+		return nil
+	}
+	spent, limit, err := s.usage.BudgetStatus(ctx, companyID)
+	if err != nil {
+		return nil
+	}
+	if spent >= limit {
+		return llm.ErrBudgetExceeded
+	}
+	return nil
+}
+
+// recordUsage nunca derruba a candidatura: perder a linha de contabilidade é ruim, mas recusar uma
+// pessoa porque a tabela de uso falhou seria pior. O erro sobe como log, não como resposta.
+func (s *service) recordUsage(ctx context.Context, companyID, campaignID, fingerprint string, usage llm.Usage, status, errCode string) {
+	if s.usage == nil {
+		return
+	}
+	campaign := campaignID
+	_ = s.usage.Record(ctx, &llmusage.Record{
+		CompanyID:   companyID,
+		CampaignID:  &campaign,
+		Operation:   llmusage.OperationExtraction,
+		Usage:       usage,
+		Status:      status,
+		ErrorCode:   errCode,
+		Fingerprint: fingerprint,
+	})
 }
 
 func toCandidateExperience(entries []llm.ExperienceEntry) []ExperienceEntry {
@@ -436,7 +598,8 @@ func toCandidateExperience(entries []llm.ExperienceEntry) []ExperienceEntry {
 // candidato — toda falha de IA vira a mesma sugestão acionável: tentar o formulário manual.
 func mapExtractionError(err error) error {
 	if errors.Is(err, llm.ErrRefused) || errors.Is(err, llm.ErrMalformedOutput) ||
-		errors.Is(err, llm.ErrRateLimited) || errors.Is(err, llm.ErrProviderUnavailable) {
+		errors.Is(err, llm.ErrRateLimited) || errors.Is(err, llm.ErrProviderUnavailable) ||
+		errors.Is(err, llm.ErrBudgetExceeded) || errors.Is(err, llm.ErrUnsupportedInput) {
 		return apperror.BadRequest("não foi possível processar seu currículo automaticamente. Tente o formulário manual.")
 	}
 	return apperror.Internal("falha ao processar candidatura")

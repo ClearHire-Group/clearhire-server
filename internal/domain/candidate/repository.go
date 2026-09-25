@@ -2,6 +2,7 @@ package candidate
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 
@@ -31,6 +32,16 @@ type Repository interface {
 	// FindBasicByID é a versão leve de FindByID usada dentro da transação de Decide — só os campos
 	// necessários pra decidir (fase atual, campanha, nome/e-mail pro caso de virar talento).
 	FindBasicByID(ctx context.Context, companyID, id string) (*Candidate, error)
+	// FindJobContext devolve os campos da vaga que a avaliação de IA usa. nil, nil quando a
+	// campanha não existe ou é de outra empresa.
+	FindJobContext(ctx context.Context, companyID, campaignID string) (*llm.JobContext, error)
+	// FindAssessmentVersion devolve a avaliação já gravada para (candidato, fase, versão do prompt),
+	// ou nil, nil — pedir a mesma avaliação de novo é leitura, não chamada paga.
+	FindAssessmentVersion(ctx context.Context, candidateID, phaseKey, promptVersion string) (*AIAssessment, error)
+	// SaveAssessment grava a avaliação e seus pontos e tira o candidato de 'aguardando_triagem_ia'.
+	// Devolve false quando outra requisição já gravou a mesma (candidato, fase, versão) — a segunda
+	// perde a corrida sem erro e sem linha duplicada. Roda dentro de uma transação do service.
+	SaveAssessment(ctx context.Context, candidateID, phaseKey string, a *llm.Assessment, origin AssessmentOrigin) (bool, error)
 	// LatestAssessmentID devolve o id da avaliação de IA mais recente do candidato, ou "" se ainda
 	// não foi avaliado — vira o par (recomendação × decisão) registrado em candidate_decisions.
 	LatestAssessmentID(ctx context.Context, candidateID string) (string, error)
@@ -56,6 +67,12 @@ type Repository interface {
 	// FindExistingApplication detecta candidatura duplicada — mesma campanha, mesmo e-mail
 	// (citext, comparação já é case-insensitive).
 	FindExistingApplication(ctx context.Context, campaignID, email string) (bool, error)
+	// FindCachedExtraction devolve nil, nil quando não há extração salva para este conteúdo —
+	// "não tem" é caminho normal aqui, não erro. Ver migrations/0007.
+	FindCachedExtraction(ctx context.Context, companyID, fingerprint string) (*llm.ExtractedProfile, error)
+	// SaveExtraction guarda o resultado da extração paga. Idempotente: envio concorrente do mesmo
+	// currículo não pode estourar a unique — o segundo simplesmente não sobrescreve.
+	SaveExtraction(ctx context.Context, companyID, fingerprint string, profile *llm.ExtractedProfile) error
 	// CreateTalentFromPublicApplication grava o perfil rico (extraído pela IA ou preenchido
 	// manualmente) — nunca referencia embedding, mesma disciplina de CreateTalentFromRejection.
 	CreateTalentFromPublicApplication(ctx context.Context, t *TalentSeed) (string, error)
@@ -227,13 +244,26 @@ func (r *postgresRepository) FindByID(ctx context.Context, companyID, id string)
 }
 
 func (r *postgresRepository) latestAssessment(ctx context.Context, candidateID string) (*AIAssessment, error) {
+	return r.queryAssessment(ctx, "where candidate_id = $1 order by created_at desc limit 1", candidateID)
+}
+
+// FindAssessmentVersion devolve a avaliação já gravada para (candidato, fase, versão do prompt) —
+// é o que torna pedir a mesma avaliação duas vezes uma leitura, não uma segunda chamada paga.
+func (r *postgresRepository) FindAssessmentVersion(ctx context.Context, candidateID, phaseKey, promptVersion string) (*AIAssessment, error) {
+	return r.queryAssessment(ctx, "where candidate_id = $1 and phase_key::text = $2 and prompt_version = $3 limit 1",
+		candidateID, phaseKey, promptVersion)
+}
+
+// queryAssessment lê UMA avaliação (e seus pontos) escolhida pela cláusula `where ... limit 1`.
+// nil, nil quando não há nenhuma. A cláusula é sempre uma constante deste pacote, nunca dado do
+// cliente — os valores vão em args.
+func (r *postgresRepository) queryAssessment(ctx context.Context, clause string, args ...any) (*AIAssessment, error) {
 	var assessmentID string
 	var ai AIAssessment
 	var matchLabel, matchNote, justification *string
 	row := r.db.QueryRow(ctx, `
 		select id, match_pct, match_label, match_note, justification
-		from candidate_ai_assessments where candidate_id = $1 order by created_at desc limit 1
-	`, candidateID)
+		from candidate_ai_assessments `+clause, args...)
 	err := row.Scan(&assessmentID, &ai.MatchPct, &matchLabel, &matchNote, &justification)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -280,6 +310,64 @@ func (r *postgresRepository) latestAssessment(ctx context.Context, candidateID s
 		ai.Concerns = []string{}
 	}
 	return &ai, nil
+}
+
+func (r *postgresRepository) FindJobContext(ctx context.Context, companyID, campaignID string) (*llm.JobContext, error) {
+	var j llm.JobContext
+	err := r.db.QueryRow(ctx, `
+		select title, seniority::text, modality::text, coalesce(description, ''),
+		       coalesce(responsibilities, ''), coalesce(requirements, '')
+		from campaigns where id = $1 and company_id = $2 and deleted_at is null
+	`, campaignID, companyID).Scan(&j.Title, &j.Seniority, &j.Modality, &j.Description, &j.Responsibilities, &j.Requirements)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &j, nil
+}
+
+func (r *postgresRepository) SaveAssessment(ctx context.Context, candidateID, phaseKey string, a *llm.Assessment, origin AssessmentOrigin) (bool, error) {
+	var assessmentID string
+	err := r.db.QueryRow(ctx, `
+		insert into candidate_ai_assessments
+			(candidate_id, phase_key, match_pct, match_label, match_note, justification, provider, model, prompt_version)
+		values ($1, $2, $3, nullif($4, ''), nullif($5, ''), nullif($6, ''), $7, $8, $9)
+		on conflict (candidate_id, phase_key, prompt_version) where prompt_version is not null do nothing
+		returning id
+	`, candidateID, phaseKey, a.MatchPct, a.MatchLabel, a.MatchNote, a.Justification,
+		origin.Provider, origin.Model, origin.PromptVersion).Scan(&assessmentID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil // conflito: outra requisição gravou primeiro
+		}
+		return false, err
+	}
+
+	for _, point := range []struct {
+		kind  string
+		items []string
+	}{{"strength", a.Strengths}, {"concern", a.Concerns}} {
+		for i, text := range point.items {
+			if _, err := r.db.Exec(ctx, `
+				insert into candidate_ai_assessment_points (assessment_id, kind, text, position)
+				values ($1, $2, $3, $4)
+			`, assessmentID, point.kind, text, i+1); err != nil {
+				return false, err
+			}
+		}
+	}
+
+	// Só sai de "aguardando triagem": quem já está em análise/decisão não volta atrás por causa de
+	// uma reavaliação. Nunca mexe em fase, reprovação ou decisão — a IA sugere, o RH decide.
+	if _, err := r.db.Exec(ctx, `
+		update candidates set status = 'aguardando_decisao'
+		where id = $1 and status = 'aguardando_triagem_ia'
+	`, candidateID); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (r *postgresRepository) FindPhasesByCampaign(ctx context.Context, companyID, campaignID string) ([]PhaseRow, error) {
@@ -388,6 +476,39 @@ func (r *postgresRepository) FindExistingApplication(ctx context.Context, campai
 		select exists(select 1 from candidates where campaign_id = $1 and email = $2 and deleted_at is null)
 	`, campaignID, email).Scan(&exists)
 	return exists, err
+}
+
+func (r *postgresRepository) FindCachedExtraction(ctx context.Context, companyID, fingerprint string) (*llm.ExtractedProfile, error) {
+	var raw []byte
+	err := r.db.QueryRow(ctx, `
+		select profile from resume_extractions where company_id = $1 and fingerprint = $2
+	`, companyID, fingerprint).Scan(&raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var profile llm.ExtractedProfile
+	if err := json.Unmarshal(raw, &profile); err != nil {
+		// Linha ilegível (formato antigo, escrita corrompida) não pode derrubar a candidatura —
+		// vale mais re-extrair e pagar de novo do que recusar a pessoa.
+		return nil, nil
+	}
+	return &profile, nil
+}
+
+func (r *postgresRepository) SaveExtraction(ctx context.Context, companyID, fingerprint string, profile *llm.ExtractedProfile) error {
+	raw, err := json.Marshal(profile)
+	if err != nil {
+		return err
+	}
+	_, err = r.db.Exec(ctx, `
+		insert into resume_extractions (company_id, fingerprint, profile)
+		values ($1, $2, $3)
+		on conflict (company_id, fingerprint) do nothing
+	`, companyID, fingerprint, raw)
+	return err
 }
 
 func (r *postgresRepository) CreateTalentFromPublicApplication(ctx context.Context, t *TalentSeed) (string, error) {
@@ -500,7 +621,7 @@ func (r *postgresRepository) FindSkillMentionsInText(ctx context.Context, text s
 		if seen[skillID] || term == "" {
 			continue
 		}
-		if strings.Contains(lowerText, strings.ToLower(term)) {
+		if mentionsTerm(text, lowerText, term) {
 			resolved = append(resolved, ResolvedSkill{SkillID: skillID})
 			seen[skillID] = true
 		}
@@ -535,8 +656,15 @@ func (r *postgresRepository) InsertTalentSkills(ctx context.Context, talentID st
 }
 
 func (r *postgresRepository) QueueSkillReview(ctx context.Context, companyID, rawTerm string) error {
+	// Um termo pendente por empresa (sem distinguir caixa): com IA extraindo skills de todo
+	// currículo, o mesmo "Airflow" chegaria uma vez por candidato e a fila viraria ruído.
 	_, err := r.db.Exec(ctx, `
-		insert into skill_mapping_review_queue (company_id, raw_text) values ($1, $2)
+		insert into skill_mapping_review_queue (company_id, raw_text)
+		select $1::uuid, $2::text
+		where not exists (
+			select 1 from skill_mapping_review_queue
+			where company_id = $1::uuid and status = 'pending' and lower(raw_text) = lower($2::text)
+		)
 	`, companyID, rawTerm)
 	return err
 }

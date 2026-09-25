@@ -80,6 +80,12 @@ type AIAssessment struct {
 	Concerns      []string
 }
 
+// AssessmentOrigin é quem produziu uma avaliação: o que torna cada recomendação auditável depois
+// (ver migrations/0010).
+type AssessmentOrigin struct {
+	Provider, Model, PromptVersion string
+}
+
 // CandidateDetail é tudo que a tela de perfil (GET /candidates/:id) precisa — Candidate mais
 // contato, resumo, educação, experiência, skills e a avaliação de IA mais recente. ListByCampaign
 // devolve só []Candidate (mais leve — é a listagem em coluna de fase, não a tela de perfil).
