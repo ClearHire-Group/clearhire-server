@@ -123,6 +123,15 @@ type CandidateContext struct {
 type AssessInput struct {
 	Job       JobContext
 	Candidate CandidateContext
+	// StageFocus é a instrução de foco desta fase do funil (ex.: "avalie fit cultural..."), texto
+	// pronto montado pelo domínio candidate (ver assessment.go, stageFocus) — o pacote llm não
+	// conhece phase_key, só recebe o que perguntar. Vazio nas fases sem foco definido.
+	StageFocus string
+	// PriorStageSummary é um resumo curto (não o JSON inteiro) da avaliação da fase AVALIADA
+	// anterior deste candidato, se houver — o que permite ao modelo dizer se esta fase reforça,
+	// diverge ou não acrescenta nada ao que já se sabia, sem reprocessar o perfil do zero nem
+	// custar uma segunda chamada. Vazio na primeira avaliação do candidato.
+	PriorStageSummary string
 }
 
 // Assessment é a sugestão da IA para o recrutador. É sempre uma sugestão: nada no sistema decide
@@ -135,6 +144,16 @@ type Assessment struct {
 	Justification string
 	Strengths     []string
 	Concerns      []string
+	// Confidence é 'alta'|'media'|'baixa'|'insuficiente' — ver o mesmo campo em
+	// internal/domain/candidate.AIAssessment pro significado completo de 'insuficiente'.
+	Confidence string
+	// StageInsight é o insight curto específico do StageFocus pedido. Vazio quando StageFocus
+	// também foi vazio (nada de específico foi pedido).
+	StageInsight       string
+	MissingInformation []string
+	// ComparisonFlag é 'reforca_anterior'|'diverge_anterior'|'novo', só preenchido quando
+	// PriorStageSummary não estava vazio (havia o que comparar).
+	ComparisonFlag string
 }
 
 // Assessor é o único ponto de contato do resto do sistema com a IA de avaliação de candidato.

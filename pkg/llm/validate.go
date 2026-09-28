@@ -18,25 +18,34 @@ import (
 // DEPOIS de a extração já ter sido paga.
 
 const (
-	maxNameLen       = 200
-	maxEmailLen      = 254
-	maxPhoneLen      = 30
-	maxShortFieldLen = 100
-	maxURLLen        = 500
-	maxNoteLen       = 500
-	maxSummaryLen    = 4000
-	maxExperience    = 20
-	maxSkills        = 40
-	maxSectors       = 20
-	maxLanguages     = 20
-	maxYears         = 60
-	maxSalary        = 1_000_000 // numeric(10,2) estoura em ~100M; acima de 1M/mês já é lixo
-	maxPoints        = 6
-	maxPointLen      = 300
-	maxLabelLen      = 40
-	maxMatchNoteLen  = 160
-	maxJustification = 2000
+	maxNameLen         = 200
+	maxEmailLen        = 254
+	maxPhoneLen        = 30
+	maxShortFieldLen   = 100
+	maxURLLen          = 500
+	maxNoteLen         = 500
+	maxSummaryLen      = 4000
+	maxExperience      = 20
+	maxSkills          = 40
+	maxSectors         = 20
+	maxLanguages       = 20
+	maxYears           = 60
+	maxSalary          = 1_000_000 // numeric(10,2) estoura em ~100M; acima de 1M/mês já é lixo
+	maxPoints          = 6
+	maxPointLen        = 300
+	maxLabelLen        = 40
+	maxMatchNoteLen    = 160
+	maxJustification   = 2000
+	maxStageInsightLen = 400
 )
+
+// validConfidence espelha o check constraint de candidate_ai_assessments.confidence
+// (migrations/0013). 'insuficiente' é estado deliberado da IA (não concluir), nunca um valor
+// inventado por sanitização — só aparece aqui pra reconhecer que é válido, não pra ser o default.
+var validConfidence = map[string]bool{"alta": true, "media": true, "baixa": true, "insuficiente": true}
+
+// validComparisonFlag espelha o mesmo check constraint de comparison_flag.
+var validComparisonFlag = map[string]bool{"reforca_anterior": true, "diverge_anterior": true, "novo": true}
 
 var linkedinPattern = regexp.MustCompile(`(?i)^(https?://)?([a-z0-9-]+\.)?linkedin\.com/`)
 
@@ -264,4 +273,20 @@ func SanitizeAssessment(a *Assessment) {
 	a.Justification = cleanText(a.Justification, maxJustification)
 	a.Strengths = cleanList(a.Strengths, maxPoints, maxPointLen)
 	a.Concerns = cleanList(a.Concerns, maxPoints, maxPointLen)
+
+	// Confidence garbled ou fora do conjunto conhecido cai em 'baixa' — o conservador dos dois
+	// lados possíveis: mostra a avaliação (não suprime dado que pode ser real), mas com o rótulo
+	// de confiança que menos convida a decidir só com base nela. Nunca defaulta pra
+	// 'insuficiente': isso apagaria uma avaliação que o modelo pode ter feito de verdade só porque
+	// o campo de confiança saiu malformado.
+	a.Confidence = strings.ToLower(strings.TrimSpace(a.Confidence))
+	if !validConfidence[a.Confidence] {
+		a.Confidence = "baixa"
+	}
+	a.StageInsight = cleanText(a.StageInsight, maxStageInsightLen)
+	a.MissingInformation = cleanList(a.MissingInformation, maxPoints, maxPointLen)
+	a.ComparisonFlag = strings.ToLower(strings.TrimSpace(a.ComparisonFlag))
+	if !validComparisonFlag[a.ComparisonFlag] {
+		a.ComparisonFlag = ""
+	}
 }

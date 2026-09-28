@@ -42,9 +42,22 @@ type Repository interface {
 	// Devolve false quando outra requisição já gravou a mesma (candidato, fase, versão) — a segunda
 	// perde a corrida sem erro e sem linha duplicada. Roda dentro de uma transação do service.
 	SaveAssessment(ctx context.Context, candidateID, phaseKey string, a *llm.Assessment, origin AssessmentOrigin) (bool, error)
-	// LatestAssessmentID devolve o id da avaliação de IA mais recente do candidato, ou "" se ainda
-	// não foi avaliado — vira o par (recomendação × decisão) registrado em candidate_decisions.
-	LatestAssessmentID(ctx context.Context, candidateID string) (string, error)
+	// LatestAssessmentID devolve o id da avaliação de IA mais recente do candidato NESTA FASE, ou ""
+	// se ele ainda não foi avaliado nela — vira o par (recomendação × decisão) registrado em
+	// candidate_decisions. Escopado por fase de propósito: antes buscava a mais recente entre TODAS
+	// as fases, o que ligava a decisão a uma avaliação de uma etapa anterior quando o candidato
+	// avançava sem ser reavaliado — corrigido junto da migration 0013.
+	LatestAssessmentID(ctx context.Context, candidateID, phaseKey string) (string, error)
+	// AssessmentHistory devolve TODA avaliação já gravada do candidato (uma por fase distinta —
+	// distinct on phase_key, a mais recente quando há mais de uma versão de prompt na mesma fase),
+	// mais antiga primeiro. É a trilha de "o que a IA dizia em cada etapa" que o schema já suporta
+	// desde a v1 (ver comentário de candidate_ai_assessments em migrations/0001_init.sql) e que
+	// nenhum caminho de leitura expunha até aqui.
+	AssessmentHistory(ctx context.Context, candidateID string) ([]AIAssessmentHistoryEntry, error)
+	// PriorStageAssessment devolve a avaliação mais recente do candidato numa fase DIFERENTE da
+	// informada, ou nil, nil se esta é a primeira fase avaliada — usada pra dar à IA um resumo
+	// curto do que já se sabia, em vez de reavaliar do zero (ver assessment.go, buildAssessInput).
+	PriorStageAssessment(ctx context.Context, candidateID, excludePhaseKey string) (*AIAssessment, string, error)
 	// AdvancePhase mata dois coelhos numa Exec só: move o candidato pra nextPhaseKey e já ajusta o
 	// status pro que faz sentido na fase nova. Devolve false se o candidato não existe/não é desta
 	// empresa (0 linhas afetadas).
@@ -161,8 +174,12 @@ func (r *postgresRepository) ListByCampaign(ctx context.Context, companyID, camp
 		       a.match_pct
 		from candidates c
 		left join lateral (
+			-- Escopado à fase ATUAL do candidato (c.phase_key, correlacionado) — antes pegava a
+			-- avaliação mais recente entre TODAS as fases, então um candidato que avançava sem
+			-- reavaliação mostrava o match de uma etapa anterior sob o rótulo da etapa nova.
 			select match_pct from candidate_ai_assessments
-			where candidate_id = c.id order by created_at desc limit 1
+			where candidate_id = c.id and phase_key = c.phase_key
+			order by created_at desc limit 1
 		) a on true
 		where c.company_id = $1 and c.campaign_id = $2 and c.deleted_at is null
 		  -- cast pra text de propósito: phase_key é enum, e comparar enum = '' (parâmetro vazio
@@ -253,17 +270,26 @@ func (r *postgresRepository) FindByID(ctx context.Context, companyID, id string)
 		d.Skills = []string{}
 	}
 
-	ai, err := r.latestAssessment(ctx, id)
+	ai, err := r.latestAssessment(ctx, id, d.PhaseKey)
 	if err != nil {
 		return nil, err
 	}
 	d.AI = ai
 
+	history, err := r.AssessmentHistory(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	d.AIHistory = history
+
 	return &d, nil
 }
 
-func (r *postgresRepository) latestAssessment(ctx context.Context, candidateID string) (*AIAssessment, error) {
-	return r.queryAssessment(ctx, "where candidate_id = $1 order by created_at desc limit 1", candidateID)
+// latestAssessment busca a avaliação mais recente do candidato NESTA fase — não a mais recente
+// entre todas (ver comentário em ListByCampaign pro porquê disso importar).
+func (r *postgresRepository) latestAssessment(ctx context.Context, candidateID, phaseKey string) (*AIAssessment, error) {
+	return r.queryAssessment(ctx, "where candidate_id = $1 and phase_key::text = $2 order by created_at desc limit 1",
+		candidateID, phaseKey)
 }
 
 // FindAssessmentVersion devolve a avaliação já gravada para (candidato, fase, versão do prompt) —
@@ -279,11 +305,13 @@ func (r *postgresRepository) FindAssessmentVersion(ctx context.Context, candidat
 func (r *postgresRepository) queryAssessment(ctx context.Context, clause string, args ...any) (*AIAssessment, error) {
 	var assessmentID string
 	var ai AIAssessment
-	var matchLabel, matchNote, justification *string
+	var matchLabel, matchNote, justification, confidence, stageInsight, comparisonFlag *string
 	row := r.db.QueryRow(ctx, `
-		select id, match_pct, match_label, match_note, justification
+		select id, match_pct, match_label, match_note, justification,
+		       confidence, stage_insight, missing_information, comparison_flag
 		from candidate_ai_assessments `+clause, args...)
-	err := row.Scan(&assessmentID, &ai.MatchPct, &matchLabel, &matchNote, &justification)
+	err := row.Scan(&assessmentID, &ai.MatchPct, &matchLabel, &matchNote, &justification,
+		&confidence, &stageInsight, &ai.MissingInformation, &comparisonFlag)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -299,36 +327,52 @@ func (r *postgresRepository) queryAssessment(ctx context.Context, clause string,
 	if justification != nil {
 		ai.Justification = *justification
 	}
+	if confidence != nil {
+		ai.Confidence = *confidence
+	}
+	if stageInsight != nil {
+		ai.StageInsight = *stageInsight
+	}
+	if comparisonFlag != nil {
+		ai.ComparisonFlag = *comparisonFlag
+	}
+	if ai.MissingInformation == nil {
+		ai.MissingInformation = []string{}
+	}
 
-	pointRows, err := r.db.Query(ctx, `
+	strengths, concerns, err := r.loadAssessmentPoints(ctx, assessmentID)
+	if err != nil {
+		return nil, err
+	}
+	ai.Strengths, ai.Concerns = strengths, concerns
+	return &ai, nil
+}
+
+// loadAssessmentPoints devolve pontos fortes e de atenção de uma avaliação — sempre slices
+// non-nil, mesmo vazios (extraído de queryAssessment pra ser reaproveitado por AssessmentHistory e
+// PriorStageAssessment sem duplicar a query de pontos 3 vezes).
+func (r *postgresRepository) loadAssessmentPoints(ctx context.Context, assessmentID string) (strengths, concerns []string, err error) {
+	rows, err := r.db.Query(ctx, `
 		select kind, text from candidate_ai_assessment_points
 		where assessment_id = $1 order by position asc
 	`, assessmentID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	defer pointRows.Close()
-	for pointRows.Next() {
+	defer rows.Close()
+	strengths, concerns = []string{}, []string{}
+	for rows.Next() {
 		var kind, text string
-		if err := pointRows.Scan(&kind, &text); err != nil {
-			return nil, err
+		if err := rows.Scan(&kind, &text); err != nil {
+			return nil, nil, err
 		}
 		if kind == "strength" {
-			ai.Strengths = append(ai.Strengths, text)
+			strengths = append(strengths, text)
 		} else {
-			ai.Concerns = append(ai.Concerns, text)
+			concerns = append(concerns, text)
 		}
 	}
-	if err := pointRows.Err(); err != nil {
-		return nil, err
-	}
-	if ai.Strengths == nil {
-		ai.Strengths = []string{}
-	}
-	if ai.Concerns == nil {
-		ai.Concerns = []string{}
-	}
-	return &ai, nil
+	return strengths, concerns, rows.Err()
 }
 
 func (r *postgresRepository) FindJobContext(ctx context.Context, companyID, campaignID string) (*llm.JobContext, error) {
@@ -351,12 +395,15 @@ func (r *postgresRepository) SaveAssessment(ctx context.Context, candidateID, ph
 	var assessmentID string
 	err := r.db.QueryRow(ctx, `
 		insert into candidate_ai_assessments
-			(candidate_id, phase_key, match_pct, match_label, match_note, justification, provider, model, prompt_version)
-		values ($1, $2, $3, nullif($4, ''), nullif($5, ''), nullif($6, ''), $7, $8, $9)
+			(candidate_id, phase_key, match_pct, match_label, match_note, justification, provider, model,
+			 prompt_version, confidence, stage_insight, missing_information, comparison_flag)
+		values ($1, $2, $3, nullif($4, ''), nullif($5, ''), nullif($6, ''), $7, $8, $9,
+			nullif($10, ''), nullif($11, ''), $12, nullif($13, ''))
 		on conflict (candidate_id, phase_key, prompt_version) where prompt_version is not null do nothing
 		returning id
 	`, candidateID, phaseKey, a.MatchPct, a.MatchLabel, a.MatchNote, a.Justification,
-		origin.Provider, origin.Model, origin.PromptVersion).Scan(&assessmentID)
+		origin.Provider, origin.Model, origin.PromptVersion,
+		a.Confidence, a.StageInsight, a.MissingInformation, a.ComparisonFlag).Scan(&assessmentID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, nil // conflito: outra requisição gravou primeiro
@@ -413,11 +460,16 @@ func (r *postgresRepository) FindPhasesByCampaign(ctx context.Context, companyID
 	return phases, rows.Err()
 }
 
-func (r *postgresRepository) LatestAssessmentID(ctx context.Context, candidateID string) (string, error) {
+// LatestAssessmentID é escopado à fase informada — a avaliação "que estava na tela" quando o RH
+// decide é sempre a da fase em que o candidato está decidindo, nunca a mais recente entre todas
+// (mesmo motivo do comentário em ListByCampaign).
+func (r *postgresRepository) LatestAssessmentID(ctx context.Context, candidateID, phaseKey string) (string, error) {
 	var id string
 	row := r.db.QueryRow(ctx, `
-		select id from candidate_ai_assessments where candidate_id = $1 order by created_at desc limit 1
-	`, candidateID)
+		select id from candidate_ai_assessments
+		where candidate_id = $1 and phase_key::text = $2
+		order by created_at desc limit 1
+	`, candidateID, phaseKey)
 	err := row.Scan(&id)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -426,6 +478,129 @@ func (r *postgresRepository) LatestAssessmentID(ctx context.Context, candidateID
 		return "", err
 	}
 	return id, nil
+}
+
+// AssessmentHistory devolve a avaliação mais recente de cada fase já avaliada deste candidato
+// (uma por fase — distinct on phase_key, a de created_at mais recente quando há mais de uma versão
+// de prompt na mesma fase), na ordem do FUNIL DESTA CAMPANHA — não a ordem de declaração do enum
+// phase_key, que não reflete a reordenação de fases opcionais que a campanha pode ter (ver
+// campaign_phases.position). recebidos/selecionados são as bordas fixas do funil (não têm linha em
+// campaign_phases, só as 3 fases opcionais têm) — por isso o coalesce nos extremos.
+func (r *postgresRepository) AssessmentHistory(ctx context.Context, candidateID string) ([]AIAssessmentHistoryEntry, error) {
+	rows, err := r.db.Query(ctx, `
+		select id, phase_key, match_pct, match_label, match_note, justification,
+		       confidence, stage_insight, missing_information, comparison_flag, created_at
+		from (
+			select distinct on (a.phase_key)
+			       a.id, a.phase_key::text as phase_key, a.match_pct, a.match_label, a.match_note,
+			       a.justification, a.confidence, a.stage_insight, a.missing_information,
+			       a.comparison_flag, a.created_at,
+			       coalesce(cp.position,
+			         case a.phase_key when 'recebidos' then -1 when 'selecionados' then 999 else 0 end
+			       ) as funnel_position
+			from candidate_ai_assessments a
+			join candidates c on c.id = a.candidate_id
+			left join campaign_phases cp on cp.campaign_id = c.campaign_id and cp.phase_key = a.phase_key
+			where a.candidate_id = $1
+			order by a.phase_key, a.created_at desc
+		) latest_per_phase
+		order by funnel_position asc
+	`, candidateID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	entries := make([]AIAssessmentHistoryEntry, 0)
+	for rows.Next() {
+		var e AIAssessmentHistoryEntry
+		var assessmentID string
+		var matchLabel, matchNote, justification, confidence, stageInsight, comparisonFlag *string
+		if err := rows.Scan(&assessmentID, &e.PhaseKey, &e.Assessment.MatchPct, &matchLabel, &matchNote,
+			&justification, &confidence, &stageInsight, &e.Assessment.MissingInformation, &comparisonFlag,
+			&e.CreatedAt); err != nil {
+			return nil, err
+		}
+		if matchLabel != nil {
+			e.Assessment.MatchLabel = *matchLabel
+		}
+		if matchNote != nil {
+			e.Assessment.MatchNote = *matchNote
+		}
+		if justification != nil {
+			e.Assessment.Justification = *justification
+		}
+		if confidence != nil {
+			e.Assessment.Confidence = *confidence
+		}
+		if stageInsight != nil {
+			e.Assessment.StageInsight = *stageInsight
+		}
+		if comparisonFlag != nil {
+			e.Assessment.ComparisonFlag = *comparisonFlag
+		}
+		if e.Assessment.MissingInformation == nil {
+			e.Assessment.MissingInformation = []string{}
+		}
+		strengths, concerns, err := r.loadAssessmentPoints(ctx, assessmentID)
+		if err != nil {
+			return nil, err
+		}
+		e.Assessment.Strengths, e.Assessment.Concerns = strengths, concerns
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
+}
+
+// PriorStageAssessment devolve a avaliação mais recente do candidato numa fase diferente da
+// informada — na prática, quase sempre a da fase imediatamente anterior, porque a avaliação de uma
+// fase só é pedida depois de o candidato já ter avançado até ela. "" quando não há nenhuma.
+func (r *postgresRepository) PriorStageAssessment(ctx context.Context, candidateID, excludePhaseKey string) (*AIAssessment, string, error) {
+	var assessmentID, phaseKey string
+	var ai AIAssessment
+	var matchLabel, matchNote, justification, confidence, stageInsight, comparisonFlag *string
+	row := r.db.QueryRow(ctx, `
+		select id, phase_key::text, match_pct, match_label, match_note, justification,
+		       confidence, stage_insight, missing_information, comparison_flag
+		from candidate_ai_assessments
+		where candidate_id = $1 and phase_key::text <> $2
+		order by created_at desc limit 1
+	`, candidateID, excludePhaseKey)
+	err := row.Scan(&assessmentID, &phaseKey, &ai.MatchPct, &matchLabel, &matchNote, &justification,
+		&confidence, &stageInsight, &ai.MissingInformation, &comparisonFlag)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, "", nil
+		}
+		return nil, "", err
+	}
+	if matchLabel != nil {
+		ai.MatchLabel = *matchLabel
+	}
+	if matchNote != nil {
+		ai.MatchNote = *matchNote
+	}
+	if justification != nil {
+		ai.Justification = *justification
+	}
+	if confidence != nil {
+		ai.Confidence = *confidence
+	}
+	if stageInsight != nil {
+		ai.StageInsight = *stageInsight
+	}
+	if comparisonFlag != nil {
+		ai.ComparisonFlag = *comparisonFlag
+	}
+	if ai.MissingInformation == nil {
+		ai.MissingInformation = []string{}
+	}
+	strengths, concerns, err := r.loadAssessmentPoints(ctx, assessmentID)
+	if err != nil {
+		return nil, "", err
+	}
+	ai.Strengths, ai.Concerns = strengths, concerns
+	return &ai, phaseKey, nil
 }
 
 func (r *postgresRepository) AdvancePhase(ctx context.Context, companyID, id, nextPhaseKey string, nextStatus Status) (bool, error) {

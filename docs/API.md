@@ -305,8 +305,10 @@ Rota registrada e respondendo `501 não implementado` (sem lógica por trás):
 |---|---|
 | `POST /auth/invitations/:token/accept` | segundo RH aceita convite e define senha |
 | `GET /users/:id` · `PATCH /users/:id` · `DELETE /users/:id` | perfil de RH / desativar assento |
-| `GET /candidates/:id` · `POST /candidates/:id/decisions` | candidatos e decisões manuais |
-| `POST /candidates/:id/assessment` | análise por IA (ver abaixo) |
+
+`GET /candidates/:id`, `POST /candidates/:id/decisions` e `POST /candidates/:id/assessment` já
+estão implementados (a lista acima estava desatualizada) — o segundo é documentado na seção
+"Banco de Talentos" acima (`talentId` na resposta), o terceiro logo abaixo.
 
 `GET /campaigns` · `POST /campaigns` · `GET /campaigns/:id` ·
 `POST /campaigns/:id/toggle-pause` · `POST /campaigns/:id/public-application-link`
@@ -377,16 +379,33 @@ background, depois de toda candidatura pública. **Só sugere**: nunca move de f
 ninguém (`POST /candidates/:id/decisions` continua sendo o único caminho de decisão, manual).
 
 Idempotente por (candidato, fase, versão do prompt): pedir de novo devolve a análise existente sem
-nova chamada ao provedor nem novo custo. Ao avançar de fase, uma nova análise pode ser pedida.
+nova chamada ao provedor nem novo custo. Ao avançar de fase, uma nova análise pode ser pedida — o
+prompt recebe um foco específico da fase nova (ver `stageFocus` em
+`internal/domain/candidate/assessment.go`) e um resumo curto da última fase avaliada, então a
+avaliação nova não é uma repetição da anterior.
 
 **Resposta — `200 OK`** (mesmo objeto de `ai` em `GET /candidates/:id`)
 ```json
 { "success": true, "data": {
   "matchPct": 82, "matchLabel": "Bom match", "matchNote": "Forte em backend.",
   "strengths": ["Python avançado, 6 anos"], "concerns": ["Sem experiência declarada com Kubernetes"],
-  "justification": "Seis anos de Python e pipelines de dados batem com os requisitos."
+  "justification": "Seis anos de Python e pipelines de dados batem com os requisitos.",
+  "confidence": "alta", "stageInsight": "Domínio técnico direto, sem lacuna relevante.",
+  "missingInformation": [], "comparisonFlag": "reforca_anterior"
 } }
 ```
+
+`confidence` (`alta`|`media`|`baixa`|`insuficiente`) é o único discriminador de quanto confiar
+nesta avaliação — **`insuficiente` não é erro nem nota baixa**: é a IA dizendo explicitamente que
+não tem evidência para concluir algo novo nesta fase (ver migrations/0013). Mesmo nesse caso
+`matchPct`/`strengths`/`concerns`/`justification` vêm preenchidos (o schema do modelo exige todo
+campo), mas o front não os trata como conclusão — mostra `stageInsight`/`missingInformation` em vez
+disso. `stageInsight` só vem preenchido em fases com foco definido (Fit Cultural, Triagem Técnica,
+Entrevista Estruturada — vazio em Recebidos/Selecionados). `comparisonFlag`
+(`reforca_anterior`|`diverge_anterior`|`novo`|vazio) compara com a fase avaliada anterior deste
+candidato, não com a campanha inteira; pode vir preenchido mesmo sem uma fase anterior real (efeito
+observado do modelo, não travado no schema) — o front só o exibe quando `aiHistory` também tem uma
+fase anterior de verdade.
 
 | Status | Quando |
 |---|---|
@@ -396,8 +415,15 @@ nova chamada ao provedor nem novo custo. Ao avançar de fase, uma nova análise 
 | `503` | IA não habilitada neste ambiente (`LLM_PROVIDER` ≠ `groq`) ou provedor indisponível/limitado — tente de novo |
 
 **Mudança de contrato:** `GET /candidates/:id` agora devolve `"ai": null` enquanto o candidato não foi
-avaliado (antes era um objeto zerado, exibido como "0%"). O que a IA enxerga: dados da vaga e o perfil
-estruturado do candidato — **sem** nome, e-mail, telefone ou LinkedIn.
+avaliado NESTA FASE (antes era um objeto zerado, exibido como "0%", e antes disto também confundia
+com avaliação de uma fase anterior — corrigido junto desta migration). O que a IA enxerga: dados da
+vaga e o perfil estruturado do candidato — **sem** nome, e-mail, telefone ou LinkedIn.
+
+`GET /candidates/:id` também devolve `"aiHistory": [...]` — a avaliação de cada fase ANTERIOR já
+avaliada (a atual não repete, já está em `ai`), mais antiga primeiro, na ordem do funil configurado
+desta campanha (não a ordem alfabética/de declaração do enum `phase_key` — uma campanha pode
+reordenar as fases opcionais). `[]` quando esta é a primeira fase avaliada do candidato. Cada item
+tem o mesmo formato de `ai` mais `phase`, `phaseLabel` e `createdAt`.
 
 Todos exigem token exceto onde marcado público acima. Conforme cada um saia
 do esqueleto, a seção dele sobe pra "Endpoints implementados" com o mesmo

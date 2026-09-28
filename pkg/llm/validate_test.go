@@ -172,6 +172,54 @@ func TestSanitizeAssessmentCapsTextFields(t *testing.T) {
 	}
 }
 
+// Confidence malformado (vazio ou lixo do modelo) nunca vira 'insuficiente' — isso apagaria uma
+// avaliação real que o modelo pode ter feito só porque o campo de confiança saiu errado. Cai em
+// 'baixa': mostra o dado, mas com o rótulo mais conservador.
+func TestSanitizeAssessmentDefaultsInvalidConfidenceToBaixa(t *testing.T) {
+	for _, raw := range []string{"", "  ", "certeza total", "ALTA "} {
+		a := &Assessment{Confidence: raw}
+		SanitizeAssessment(a)
+		want := "baixa"
+		if raw == "ALTA " {
+			want = "alta" // válido após TrimSpace+ToLower
+		}
+		if a.Confidence != want {
+			t.Errorf("Confidence(%q) = %q, esperava %q", raw, a.Confidence, want)
+		}
+	}
+}
+
+// 'insuficiente' é um valor válido e legítimo — não pode ser tratado como malformado.
+func TestSanitizeAssessmentPreservesInsuficiente(t *testing.T) {
+	a := &Assessment{Confidence: "insuficiente"}
+	SanitizeAssessment(a)
+	if a.Confidence != "insuficiente" {
+		t.Errorf("Confidence = %q, esperava 'insuficiente' preservado", a.Confidence)
+	}
+}
+
+func TestSanitizeAssessmentClearsInvalidComparisonFlag(t *testing.T) {
+	a := &Assessment{ComparisonFlag: "talvez"}
+	SanitizeAssessment(a)
+	if a.ComparisonFlag != "" {
+		t.Errorf("ComparisonFlag = %q, esperava vazio (valor fora do conjunto conhecido)", a.ComparisonFlag)
+	}
+
+	b := &Assessment{ComparisonFlag: "diverge_anterior"}
+	SanitizeAssessment(b)
+	if b.ComparisonFlag != "diverge_anterior" {
+		t.Errorf("ComparisonFlag válido não deveria ser apagado: %q", b.ComparisonFlag)
+	}
+}
+
+func TestSanitizeAssessmentCapsStageInsight(t *testing.T) {
+	a := &Assessment{StageInsight: strings.Repeat("x", 1000)}
+	SanitizeAssessment(a)
+	if len([]rune(a.StageInsight)) != maxStageInsightLen {
+		t.Errorf("StageInsight = %d runes, teto é %d", len([]rune(a.StageInsight)), maxStageInsightLen)
+	}
+}
+
 // O modo estrito da Groq obriga o modelo a preencher todos os campos, e ele escreve "N/A" onde não
 // sabe (visto numa chamada real, no nível de uma skill). Isso não pode virar dado gravado.
 func TestSanitizeProfileTurnsPlaceholdersIntoEmpty(t *testing.T) {

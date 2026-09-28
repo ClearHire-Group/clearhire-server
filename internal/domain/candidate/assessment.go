@@ -3,12 +3,53 @@ package candidate
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/ClearHire-Group/clearhire-server/internal/database"
 	"github.com/ClearHire-Group/clearhire-server/internal/domain/llmusage"
 	"github.com/ClearHire-Group/clearhire-server/pkg/apperror"
 	"github.com/ClearHire-Group/clearhire-server/pkg/llm"
 )
+
+// stageFocus é o que se pede à IA em CADA fase, além da avaliação geral de sempre — a variável que
+// torna a mesma chamada "ciente da fase" sem multiplicar prompts distintos (ver docs/API.md e
+// clearhire-server/CLAUDE.md). Vazio em recebidos/selecionados: ali a avaliação geral já É o
+// insight da fase, uma segunda camada de texto só repetiria matchNote/justification.
+//
+// Um mapa por phase_key, não um switch espalhado pelo código — se um dia a empresa puder
+// personalizar as próprias fases (campaign_phases hoje só reordena um subconjunto fixo de
+// fit/tecnica/entrevista, não cria fases novas), este é o único lugar que precisaria virar dado em
+// vez de constante.
+var stageFocus = map[string]string{
+	PhaseFit: "Avalie especificamente indícios de compatibilidade com o AMBIENTE E A CULTURA de " +
+		"trabalho descritos na vaga — trajetória em times com estilo de trabalho semelhante, sinais " +
+		"de autonomia, comunicação, colaboração. Não é sobre habilidade técnica.",
+	PhaseTecnica: "Avalie especificamente a ADERÊNCIA TÉCNICA aos requisitos da vaga — skills, anos " +
+		"de experiência com cada tecnologia pedida, profundidade demonstrada nas descrições de " +
+		"experiência.",
+	// Fase Entrevista: hoje o perfil do candidato não tem nenhum campo de nota/feedback de
+	// entrevista (isso é lacuna de produto, não deste prompt — ver análise da tela de Funil). O
+	// foco pede exatamente isso: se não há nada no perfil além do que as fases anteriores já
+	// viram, dizer "insuficiente" é a resposta CORRETA, não uma falha.
+	PhaseEntrevista: "Avalie se HÁ ALGO NO PERFIL que vá além do que já foi avaliado nas fases " +
+		"anteriores (ver <fase_anterior>, se houver). Se o perfil disponível é o mesmo currículo já " +
+		"visto antes, sem nenhuma nota ou registro novo de entrevista, isso não é evidência nova — " +
+		"devolva confidence \"insuficiente\" em vez de reafirmar a mesma conclusão como se fosse novidade.",
+}
+
+// priorStageSummary monta o resumo curto que vai pro modelo em <fase_anterior> — não o JSON
+// inteiro da avaliação anterior, só o essencial pra comparar (ver llm.AssessInput.PriorStageSummary
+// pro porquê disso custar uma chamada só, não duas).
+func priorStageSummary(prior *AIAssessment, priorPhaseKey string) string {
+	if prior == nil {
+		return ""
+	}
+	note := prior.StageInsight
+	if note == "" {
+		note = prior.MatchNote
+	}
+	return fmt.Sprintf("Fase %s, confiança %s: %s", phaseLabel(priorPhaseKey), prior.Confidence, note)
+}
 
 // Assess é a avaliação de IA de um candidato na fase em que ele está. É SUGESTÃO: grava a avaliação
 // (e tira o candidato de "aguardando triagem"), e só isso. Nunca chama Decide, nunca move de fase,
@@ -69,7 +110,12 @@ func (s *service) runAssessment(ctx context.Context, companyID string, d *Candid
 		return nil, mapAssessmentError(err)
 	}
 
-	assessment, usage, err := s.assessor.Assess(ctx, buildAssessInput(d, job))
+	prior, priorPhaseKey, err := s.repo.PriorStageAssessment(ctx, d.ID, d.PhaseKey)
+	if err != nil {
+		return nil, apperror.Internal("falha ao buscar avaliação de fase anterior")
+	}
+
+	assessment, usage, err := s.assessor.Assess(ctx, buildAssessInput(d, job, prior, priorPhaseKey))
 	if err != nil {
 		// Registrado ANTES de propagar, pela mesma razão da extração: resposta que chegou e foi
 		// inútil já foi cobrada.
@@ -104,9 +150,10 @@ func (s *service) runAssessment(ctx context.Context, companyID string, d *Candid
 	return stored, nil
 }
 
-// buildAssessInput monta o que o avaliador vê: a vaga e o perfil ESTRUTURADO do candidato, sem
-// nome, e-mail, telefone nem LinkedIn (ver llm.CandidateContext).
-func buildAssessInput(d *CandidateDetail, job *llm.JobContext) llm.AssessInput {
+// buildAssessInput monta o que o avaliador vê: a vaga, o perfil ESTRUTURADO do candidato (sem
+// nome, e-mail, telefone nem LinkedIn — ver llm.CandidateContext), o foco desta fase (stageFocus,
+// vazio se a fase não tem um) e o resumo da fase avaliada anterior, se houver.
+func buildAssessInput(d *CandidateDetail, job *llm.JobContext, prior *AIAssessment, priorPhaseKey string) llm.AssessInput {
 	education := d.EducationDegree
 	if d.EducationInstitution != "" {
 		if education != "" {
@@ -127,6 +174,8 @@ func buildAssessInput(d *CandidateDetail, job *llm.JobContext) llm.AssessInput {
 			Experience:      experience,
 			Skills:          d.Skills,
 		},
+		StageFocus:        stageFocus[d.PhaseKey],
+		PriorStageSummary: priorStageSummary(prior, priorPhaseKey),
 	}
 }
 

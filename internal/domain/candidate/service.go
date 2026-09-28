@@ -127,9 +127,11 @@ func (s *service) Decide(ctx context.Context, companyID, id string, req DecideRe
 		}
 
 		// A avaliação de IA que estava na tela quando a decisão foi tomada — nil quando o
-		// candidato ainda não foi avaliado (decisão manual sem sugestão da IA por trás, que
-		// também é um caso válido, só não computável na métrica de "confiança na IA").
-		assessmentID, err := txRepo.LatestAssessmentID(ctx, id)
+		// candidato ainda não foi avaliado NESTA FASE (decisão manual sem sugestão da IA por
+		// trás, que também é um caso válido, só não computável na métrica de "confiança na IA").
+		// Escopada à fase atual do candidato: uma avaliação de fase anterior não é "a que estava
+		// na tela" desta decisão.
+		assessmentID, err := txRepo.LatestAssessmentID(ctx, id, cand.PhaseKey)
 		if err != nil {
 			return apperror.Internal("falha ao buscar avaliação da IA")
 		}

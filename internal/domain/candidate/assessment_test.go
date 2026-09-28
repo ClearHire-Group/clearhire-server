@@ -55,6 +55,10 @@ type fakeAssessRepo struct {
 	saves      int
 	saved      *llm.Assessment
 	job        *llm.JobContext
+	// prior/priorPhaseKey é o que PriorStageAssessment devolve — nil/"" por padrão (candidato sem
+	// fase avaliada anterior), setável por teste pra exercitar o resumo de fase anterior.
+	prior         *AIAssessment
+	priorPhaseKey string
 }
 
 func newFakeAssessRepo() *fakeAssessRepo {
@@ -92,9 +96,17 @@ func (r *fakeAssessRepo) SaveAssessment(_ context.Context, candidateID, phaseKey
 	r.origins = append(r.origins, origin)
 	r.stored[candidateID+"|"+phaseKey+"|"+origin.PromptVersion] = &AIAssessment{
 		MatchPct: a.MatchPct, MatchLabel: a.MatchLabel, MatchNote: a.MatchNote, Justification: a.Justification,
-		Strengths: a.Strengths, Concerns: a.Concerns,
+		Strengths: a.Strengths, Concerns: a.Concerns, Confidence: a.Confidence, StageInsight: a.StageInsight,
+		MissingInformation: a.MissingInformation, ComparisonFlag: a.ComparisonFlag,
 	}
 	return true, nil
+}
+
+// PriorStageAssessment devolve o que o teste configurou em r.prior/r.priorPhaseKey — nil/"" por
+// padrão, ou seja, "sem fase anterior avaliada" é o comportamento default dos testes que não
+// mexem nisso.
+func (r *fakeAssessRepo) PriorStageAssessment(_ context.Context, _, _ string) (*AIAssessment, string, error) {
+	return r.prior, r.priorPhaseKey, nil
 }
 
 func assessService(repo *fakeAssessRepo, assessor llm.Assessor, usage llmusage.Repository) *service {
@@ -335,6 +347,71 @@ func TestAssessInputCarriesNoIdentity(t *testing.T) {
 	}
 	if assessor.lastInput.Job.Title != "Engenheira Backend" || len(assessor.lastInput.Candidate.Skills) != 1 {
 		t.Errorf("o avaliador não recebeu a vaga e as skills: %+v", assessor.lastInput)
+	}
+}
+
+// --- avaliação ciente da fase (stageFocus / resumo da fase anterior) ---
+
+// Fases com foco definido recebem a instrução extra; recebidos/selecionados (sem entrada no mapa
+// stageFocus) não recebem nada — a avaliação ali continua sendo só a geral de sempre.
+func TestAssessPassesStageFocusOnlyForPhasesWithOne(t *testing.T) {
+	cases := []struct {
+		phase     string
+		wantFocus bool
+	}{
+		{PhaseRecebidos, false},
+		{PhaseFit, true},
+		{PhaseTecnica, true},
+		{PhaseEntrevista, true},
+		{PhaseSelecionados, false},
+	}
+	for _, tc := range cases {
+		repo := newFakeAssessRepo()
+		repo.candidates["empresa-1|cand-1"].PhaseKey = tc.phase
+		assessor := goodAssessor()
+		s := assessService(repo, assessor, newRecordingUsage())
+
+		if _, err := s.Assess(context.Background(), "empresa-1", "cand-1"); err != nil {
+			t.Fatalf("%s: %v", tc.phase, err)
+		}
+		got := assessor.lastInput.StageFocus != ""
+		if got != tc.wantFocus {
+			t.Errorf("%s: StageFocus não-vazio = %v, esperava %v", tc.phase, got, tc.wantFocus)
+		}
+	}
+}
+
+// Sem fase anterior avaliada (comportamento default do fake), PriorStageSummary vai vazio — nada
+// pra comparar.
+func TestAssessOmitsPriorStageSummaryWhenThereIsNone(t *testing.T) {
+	repo := newFakeAssessRepo()
+	assessor := goodAssessor()
+	s := assessService(repo, assessor, newRecordingUsage())
+
+	if _, err := s.Assess(context.Background(), "empresa-1", "cand-1"); err != nil {
+		t.Fatal(err)
+	}
+	if assessor.lastInput.PriorStageSummary != "" {
+		t.Errorf("PriorStageSummary = %q, esperava vazio (candidato sem fase anterior avaliada)", assessor.lastInput.PriorStageSummary)
+	}
+}
+
+// Com fase anterior avaliada, o resumo chega ao avaliador — curto, não o JSON inteiro (não deve
+// carregar o texto de MissingInformation/Concerns, só o essencial pra comparar).
+func TestAssessIncludesPriorStageSummaryWhenAvailable(t *testing.T) {
+	repo := newFakeAssessRepo()
+	repo.candidates["empresa-1|cand-1"].PhaseKey = PhaseTecnica
+	repo.prior = &AIAssessment{MatchPct: 79, Confidence: "alta", StageInsight: "Forte alinhamento cultural."}
+	repo.priorPhaseKey = PhaseFit
+	assessor := goodAssessor()
+	s := assessService(repo, assessor, newRecordingUsage())
+
+	if _, err := s.Assess(context.Background(), "empresa-1", "cand-1"); err != nil {
+		t.Fatal(err)
+	}
+	summary := assessor.lastInput.PriorStageSummary
+	if !strings.Contains(summary, "Fit Cultural") || !strings.Contains(summary, "Forte alinhamento cultural") {
+		t.Errorf("PriorStageSummary = %q, esperava citar a fase e o insight anterior", summary)
 	}
 }
 

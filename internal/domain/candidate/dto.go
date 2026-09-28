@@ -172,9 +172,12 @@ type CandidateProfileResponse struct {
 	Experience      []experienceEntryResponse `json:"experience"`
 	Education       candidateEducation        `json:"education"`
 	Skills          []string                  `json:"skills"`
-	// AI é null enquanto o candidato não foi avaliado. Antes era um objeto zerado, o que a tela
-	// mostrava como "0%" — indistinguível de uma avaliação real com nota baixa.
+	// AI é null enquanto o candidato não foi avaliado NESTA FASE. Antes era um objeto zerado, o que
+	// a tela mostrava como "0%" — indistinguível de uma avaliação real com nota baixa.
 	AI *candidateAIResponse `json:"ai"`
+	// AIHistory é a avaliação de cada fase ANTERIOR já avaliada (a atual não repete — está em AI),
+	// mais antiga primeiro, na ordem do funil desta campanha — nunca vazia vira `null` no JSON.
+	AIHistory []candidateAIHistoryEntry `json:"aiHistory"`
 }
 
 type candidateContact struct {
@@ -203,6 +206,23 @@ type candidateAIResponse struct {
 	Strengths     []string `json:"strengths"`
 	Concerns      []string `json:"concerns"`
 	Justification string   `json:"justification"`
+	// Confidence é sempre um de 'alta'|'media'|'baixa'|'insuficiente' na resposta, nunca vazio —
+	// avaliações gravadas antes da migration 0013 (sem este campo no banco) saem como 'alta': era
+	// isso que elas eram, uma nota e pronto, sem o discriminador novo (ver resolveConfidence).
+	Confidence         string   `json:"confidence"`
+	StageInsight       string   `json:"stageInsight"`
+	MissingInformation []string `json:"missingInformation"`
+	ComparisonFlag     string   `json:"comparisonFlag"`
+}
+
+// resolveConfidence decide o que expor pro front quando o banco não tem confidence gravado —
+// única em ser uma decisão de PRESENTATION (o domínio, AIAssessment.Confidence, fica fiel ao banco:
+// "" quando não gravado). Ver comentário de candidateAIResponse.Confidence.
+func resolveConfidence(raw string) string {
+	if raw == "" {
+		return "alta"
+	}
+	return raw
 }
 
 func toAIResponse(a *AIAssessment) *candidateAIResponse {
@@ -210,13 +230,45 @@ func toAIResponse(a *AIAssessment) *candidateAIResponse {
 		return nil
 	}
 	return &candidateAIResponse{
-		MatchPct:      a.MatchPct,
-		MatchLabel:    a.MatchLabel,
-		MatchNote:     a.MatchNote,
-		Strengths:     a.Strengths,
-		Concerns:      a.Concerns,
-		Justification: a.Justification,
+		MatchPct:           a.MatchPct,
+		MatchLabel:         a.MatchLabel,
+		MatchNote:          a.MatchNote,
+		Strengths:          a.Strengths,
+		Concerns:           a.Concerns,
+		Justification:      a.Justification,
+		Confidence:         resolveConfidence(a.Confidence),
+		StageInsight:       a.StageInsight,
+		MissingInformation: a.MissingInformation,
+		ComparisonFlag:     a.ComparisonFlag,
 	}
+}
+
+// candidateAIHistoryEntry é uma linha do histórico de avaliações do candidato — a mesma forma de
+// candidateAIResponse, com a fase a que pertence.
+type candidateAIHistoryEntry struct {
+	Phase      string `json:"phase"`
+	PhaseLabel string `json:"phaseLabel"`
+	*candidateAIResponse
+	CreatedAt string `json:"createdAt"`
+}
+
+// toAIHistoryResponse filtra a fase ATUAL fora (ela já vai em CandidateProfileResponse.AI,
+// destacada) — "histórico" aqui é sempre "fases anteriores", nunca duplica a que já está em
+// destaque na tela.
+func toAIHistoryResponse(entries []AIAssessmentHistoryEntry, currentPhaseKey string) []candidateAIHistoryEntry {
+	out := make([]candidateAIHistoryEntry, 0, len(entries))
+	for _, e := range entries {
+		if e.PhaseKey == currentPhaseKey {
+			continue
+		}
+		out = append(out, candidateAIHistoryEntry{
+			Phase:               e.PhaseKey,
+			PhaseLabel:          phaseLabel(e.PhaseKey),
+			candidateAIResponse: toAIResponse(&e.Assessment),
+			CreatedAt:           e.CreatedAt.UTC().Format(time.RFC3339),
+		})
+	}
+	return out
 }
 
 // ResumeFileForm são os campos de texto do upload de currículo (multipart). O modo PDF não passa
@@ -258,6 +310,7 @@ func toCandidateProfileResponse(d *CandidateDetail) *CandidateProfileResponse {
 	}
 
 	ai := toAIResponse(d.AI)
+	aiHistory := toAIHistoryResponse(d.AIHistory, d.PhaseKey)
 
 	return &CandidateProfileResponse{
 		CandidateID:     d.ID,
@@ -273,5 +326,6 @@ func toCandidateProfileResponse(d *CandidateDetail) *CandidateProfileResponse {
 		Education:       candidateEducation{Degree: d.EducationDegree, Institution: d.EducationInstitution, Period: d.EducationPeriod},
 		Skills:          d.Skills,
 		AI:              ai,
+		AIHistory:       aiHistory,
 	}
 }
