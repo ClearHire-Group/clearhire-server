@@ -259,6 +259,44 @@ ação que deu rollback não deixa rastro no histórico.
 
 ---
 
+### `GET /dashboard/ai-suggestions` — card "Pendências de revisão"
+
+Protegido. **Sem LLM**: consulta + regra determinística sobre avaliações que a IA já gravou
+(`candidate_ai_assessments`), nunca uma chamada nova ao provedor. Duas fontes, nesta ordem:
+
+1. Candidatos com `status = 'aguardando_decisao'` cuja avaliação mais recente **na fase atual**
+   tem `match_pct >= 80` (`internal/domain/dashboard/service.go`, `readyMatchThreshold`) — maior
+   match primeiro, até 3. O primeiro da lista vem com `highlighted: true`.
+2. Grupos de candidatos `aguardando_decisao` por (campanha, fase) com 2 ou mais candidatos — maior
+   grupo primeiro, até 2.
+
+Um candidato pode aparecer nos dois: no individual (pelo match) e contado no grupo da fase (pela
+espera) — respondem perguntas diferentes ("quem ver primeiro" × "quanto está parado"). Sem
+candidata nenhuma, `data` é `[]`, nunca `null`.
+
+**Resposta — `200 OK`**
+```json
+{ "success": true, "data": [
+  { "id": "ready-3fac…", "message": "Marina Albuquerque (94% de match) pode avançar de Triagem Técnica para Entrevista Estruturada em Eng. Backend Sênior.",
+    "primaryActionLabel": "Revisar candidatura", "primaryActionRoute": ["/campanhas", "6726…", "candidatos", "3fac…"],
+    "highlighted": true },
+  { "id": "waiting-6726…-fit", "message": "7 candidatos analisados em Fit Cultural para Customer Success Pleno aguardam sua decisão.",
+    "primaryActionLabel": "Ver candidatos", "primaryActionRoute": ["/campanhas", "6726…", "candidatos"],
+    "highlighted": false }
+] }
+```
+
+`primaryActionRoute` é a lista de segmentos que o `routerLink` do Angular espera, não uma URL
+pronta. `id` não é persistido — é montado a partir do id do candidato ou de (campanha, fase), então
+muda se o candidato avançar/sair da lista, o que é o comportamento esperado (a lista sempre reflete
+o estado atual, nunca um histórico).
+
+**Escrita**: não existe. Ao contrário de `ai_suggestions` (tabela do schema, hoje sem nenhum
+código lendo ou escrevendo nela), este endpoint não persiste nada — cada chamada recalcula na
+hora, então não há "sugestão dispensada" nem card obsoleto.
+
+---
+
 ## Ainda não implementado
 
 Rota registrada e respondendo `501 não implementado` (sem lógica por trás):

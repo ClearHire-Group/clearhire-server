@@ -30,3 +30,28 @@ func toResponse(m *Metrics) *Response {
 		AvgFunnelDaysTrend:              m.AvgFunnelDaysTrend,
 	}
 }
+
+// SuggestionResponse é o formato exposto em GET /dashboard/ai-suggestions — mesmo shape de
+// AiSuggestion no front (clearhire-app/src/app/core/models.ts). PrimaryActionRoute é a lista de
+// segmentos que o routerLink do Angular espera (["/campanhas", id, "candidatos", id]), não uma URL.
+type SuggestionResponse struct {
+	ID                 string   `json:"id"`
+	Message            string   `json:"message"`
+	PrimaryActionLabel string   `json:"primaryActionLabel"`
+	PrimaryActionRoute []string `json:"primaryActionRoute"`
+	Highlighted        bool     `json:"highlighted"`
+}
+
+func toSuggestionResponses(items []Suggestion) []SuggestionResponse {
+	out := make([]SuggestionResponse, 0, len(items))
+	for _, s := range items {
+		out = append(out, SuggestionResponse{
+			ID:                 s.ID,
+			Message:            s.Message,
+			PrimaryActionLabel: s.PrimaryActionLabel,
+			PrimaryActionRoute: s.PrimaryActionRoute,
+			Highlighted:        s.Highlighted,
+		})
+	}
+	return out
+}

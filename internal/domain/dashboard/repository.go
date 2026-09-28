@@ -29,6 +29,14 @@ type Repository interface {
 	// generate_series só: mais simples de ler e evita lidar com parâmetro de INTERVAL do pgx.
 	ActiveCampaignsTrend(ctx context.Context, companyID string, refDays []time.Time) ([]int, error)
 	AvgFunnelDaysTrend(ctx context.Context, companyID string, refDays []time.Time) ([]float64, error)
+
+	// ReadyToAdvance devolve os candidatos aguardando decisão do RH cuja avaliação de IA MAIS
+	// RECENTE, na fase em que estão agora, tem match_pct >= minMatch — maior match primeiro, o mais
+	// antigo na frente em caso de empate. Só campanhas ativas: pausada/encerrada não pede ação.
+	ReadyToAdvance(ctx context.Context, companyID string, minMatch, limit int) ([]ReadyCandidate, error)
+	// WaitingByPhase agrupa os candidatos aguardando decisão por (campanha, fase) e devolve só os
+	// grupos com pelo menos minCount candidatos, do maior pro menor.
+	WaitingByPhase(ctx context.Context, companyID string, minCount, limit int) ([]WaitingGroup, error)
 }
 
 type postgresRepository struct {
@@ -128,4 +136,86 @@ func (r *postgresRepository) AvgFunnelDaysTrend(ctx context.Context, companyID s
 		}
 	}
 	return values, nil
+}
+
+func (r *postgresRepository) ReadyToAdvance(ctx context.Context, companyID string, minMatch, limit int) ([]ReadyCandidate, error) {
+	// company_id vem SEMPRE do usuário autenticado (CLAUDE.md): o join com campaigns repete
+	// company_id de propósito, e o `where` filtra os dois lados. A avaliação é a mais recente DA
+	// FASE ATUAL do candidato — uma nota de fase anterior não diz nada sobre a etapa em que ele
+	// está; sem avaliação nessa fase, o candidato simplesmente não entra (join lateral interno).
+	// A próxima fase é a de menor `position` acima da atual naquela campanha (funil configurável).
+	rows, err := r.db.Query(ctx, `
+		select c.id, c.name, c.campaign_id, camp.title, c.phase_key::text,
+		       coalesce((
+		         select nxt.phase_key::text
+		         from campaign_phases nxt
+		         where nxt.campaign_id = c.campaign_id and nxt.position > cp.position
+		         order by nxt.position
+		         limit 1
+		       ), ''),
+		       a.match_pct
+		from candidates c
+		join campaigns camp
+		  on camp.id = c.campaign_id and camp.company_id = c.company_id
+		join campaign_phases cp
+		  on cp.campaign_id = c.campaign_id and cp.phase_key = c.phase_key
+		join lateral (
+		  select ai.match_pct
+		  from candidate_ai_assessments ai
+		  where ai.candidate_id = c.id and ai.phase_key = c.phase_key
+		  order by ai.created_at desc
+		  limit 1
+		) a on true
+		where c.company_id = $1 and c.deleted_at is null
+		  and camp.deleted_at is null and camp.status = 'ativa'
+		  and c.status = 'aguardando_decisao'
+		  and a.match_pct >= $2
+		order by a.match_pct desc, c.created_at asc, c.id
+		limit $3
+	`, companyID, minMatch, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]ReadyCandidate, 0)
+	for rows.Next() {
+		var rc ReadyCandidate
+		if err := rows.Scan(&rc.CandidateID, &rc.CandidateName, &rc.CampaignID, &rc.CampaignTitle,
+			&rc.PhaseKey, &rc.NextPhaseKey, &rc.MatchPct); err != nil {
+			return nil, err
+		}
+		out = append(out, rc)
+	}
+	return out, rows.Err()
+}
+
+func (r *postgresRepository) WaitingByPhase(ctx context.Context, companyID string, minCount, limit int) ([]WaitingGroup, error) {
+	rows, err := r.db.Query(ctx, `
+		select c.campaign_id, camp.title, c.phase_key::text, count(*)
+		from candidates c
+		join campaigns camp
+		  on camp.id = c.campaign_id and camp.company_id = c.company_id
+		where c.company_id = $1 and c.deleted_at is null
+		  and camp.deleted_at is null and camp.status = 'ativa'
+		  and c.status = 'aguardando_decisao'
+		group by c.campaign_id, camp.title, c.phase_key
+		having count(*) >= $2
+		order by count(*) desc, camp.title, c.phase_key
+		limit $3
+	`, companyID, minCount, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]WaitingGroup, 0)
+	for rows.Next() {
+		var g WaitingGroup
+		if err := rows.Scan(&g.CampaignID, &g.CampaignTitle, &g.PhaseKey, &g.Count); err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
 }

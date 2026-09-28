@@ -19,7 +19,9 @@ func NewHandler(service Service) *Handler {
 }
 
 func (h *Handler) RegisterRoutes(router fiber.Router) {
-	router.Group("/dashboard").Get("/metrics", h.GetMetrics)
+	dashboard := router.Group("/dashboard")
+	dashboard.Get("/metrics", h.GetMetrics)
+	dashboard.Get("/ai-suggestions", h.GetSuggestions)
 }
 
 func (h *Handler) GetMetrics(c *fiber.Ctx) error {
@@ -28,6 +30,14 @@ func (h *Handler) GetMetrics(c *fiber.Ctx) error {
 		return h.respondError(c, err)
 	}
 	return response.OK(c, toResponse(metrics))
+}
+
+func (h *Handler) GetSuggestions(c *fiber.Ctx) error {
+	items, err := h.service.GetSuggestions(c.Context(), middleware.CompanyID(c))
+	if err != nil {
+		return h.respondError(c, err)
+	}
+	return response.OK(c, toSuggestionResponses(items))
 }
 
 func (h *Handler) respondError(c *fiber.Ctx, err error) error {
