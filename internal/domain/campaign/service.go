@@ -43,8 +43,10 @@ type Service interface {
 	// TogglePause recebe actedByUserID só pra registrar quem pausou/retomou no feed de atividade —
 	// a decisão em si não depende de quem chama (qualquer RH da empresa pode).
 	TogglePause(ctx context.Context, companyID, id, actedByUserID string) (*CampaignView, error)
-	FunnelSummary(ctx context.Context, companyID string) ([]PhaseCount, error)
-	CampaignPerformance(ctx context.Context, companyID string) ([]PerformanceRow, error)
+	// Os dois agregados da tela Relatórios aceitam recorte por data de candidatura; ReportPeriod
+	// zerado = todo o período.
+	FunnelSummary(ctx context.Context, companyID string, period ReportPeriod) ([]PhaseCount, error)
+	CampaignPerformance(ctx context.Context, companyID string, period ReportPeriod) ([]PerformanceRow, error)
 	// SetPublicApplicationsEnabled liga/desliga o link de candidatura pública desta campanha.
 	SetPublicApplicationsEnabled(ctx context.Context, companyID, id string, enabled bool) (*CampaignView, error)
 	// GetPublicInfo é a única leitura sem tenant deste domínio — chamada de uma rota pública, sem
@@ -89,7 +91,8 @@ func (s *service) List(ctx context.Context, companyID string) ([]CampaignView, e
 		return nil, apperror.Internal("falha ao listar campanhas")
 	}
 
-	allPhases, err := s.repo.PhaseCountsByCompany(ctx, companyID)
+	// Sem recorte: a tela de Campanhas mostra o funil inteiro de cada campanha, não um mês.
+	allPhases, err := s.repo.PhaseCountsByCompany(ctx, companyID, ReportPeriod{})
 	if err != nil {
 		return nil, apperror.Internal("falha ao calcular funil das campanhas")
 	}
@@ -343,8 +346,8 @@ func (s *service) GetPublicInfo(ctx context.Context, id string) (*PublicInfo, er
 	return info, nil
 }
 
-func (s *service) FunnelSummary(ctx context.Context, companyID string) ([]PhaseCount, error) {
-	counts, err := s.repo.PhaseCountsByCompany(ctx, companyID)
+func (s *service) FunnelSummary(ctx context.Context, companyID string, period ReportPeriod) ([]PhaseCount, error) {
+	counts, err := s.repo.PhaseCountsByCompany(ctx, companyID, period)
 	if err != nil {
 		return nil, apperror.Internal("falha ao calcular funil agregado")
 	}
@@ -364,13 +367,16 @@ func (s *service) FunnelSummary(ctx context.Context, companyID string) ([]PhaseC
 	return summary, nil
 }
 
-func (s *service) CampaignPerformance(ctx context.Context, companyID string) ([]PerformanceRow, error) {
+func (s *service) CampaignPerformance(ctx context.Context, companyID string, period ReportPeriod) ([]PerformanceRow, error) {
+	// A LISTA de campanhas nunca é recortada pelo período, só as contagens: uma campanha que não
+	// recebeu ninguém no mês continua na tabela, com zero. Sumir da lista pareceria campanha
+	// apagada, e "não recebeu candidatura neste mês" é informação, não ausência de informação.
 	campaigns, err := s.repo.ListByCompany(ctx, companyID)
 	if err != nil {
 		return nil, apperror.Internal("falha ao listar campanhas")
 	}
 
-	allPhases, err := s.repo.PhaseCountsByCompany(ctx, companyID)
+	allPhases, err := s.repo.PhaseCountsByCompany(ctx, companyID, period)
 	if err != nil {
 		return nil, apperror.Internal("falha ao calcular funil das campanhas")
 	}

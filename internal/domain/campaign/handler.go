@@ -2,6 +2,7 @@ package campaign
 
 import (
 	"errors"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 
@@ -167,8 +168,37 @@ func (h *Handler) GetPublicInfo(c *fiber.Ctx) error {
 	return response.OK(c, toPublicInfoResponse(info))
 }
 
+// parseReportPeriod lê `from`/`to` da query string em RFC3339 (ex.: 2026-09-01T00:00:00-03:00).
+// São instantes COM fuso, não datas soltas: quem sabe em que fuso o usuário está é o navegador,
+// então o recorte chega pronto e nenhuma query precisa chutar um timezone. Ausentes = sem limite.
+func parseReportPeriod(c *fiber.Ctx) (ReportPeriod, error) {
+	var period ReportPeriod
+	for _, field := range []struct {
+		name   string
+		target **time.Time
+	}{{"from", &period.From}, {"to", &period.To}} {
+		raw := c.Query(field.name)
+		if raw == "" {
+			continue
+		}
+		parsed, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return period, apperror.BadRequest("parâmetro '" + field.name + "' inválido: use data no formato RFC3339")
+		}
+		*field.target = &parsed
+	}
+	if period.From != nil && period.To != nil && !period.To.After(*period.From) {
+		return period, apperror.BadRequest("o fim do período precisa ser posterior ao início")
+	}
+	return period, nil
+}
+
 func (h *Handler) FunnelSummary(c *fiber.Ctx) error {
-	summary, err := h.service.FunnelSummary(c.Context(), middleware.CompanyID(c))
+	period, err := parseReportPeriod(c)
+	if err != nil {
+		return h.respondError(c, err)
+	}
+	summary, err := h.service.FunnelSummary(c.Context(), middleware.CompanyID(c), period)
 	if err != nil {
 		return h.respondError(c, err)
 	}
@@ -180,7 +210,11 @@ func (h *Handler) FunnelSummary(c *fiber.Ctx) error {
 }
 
 func (h *Handler) CampaignPerformance(c *fiber.Ctx) error {
-	rows, err := h.service.CampaignPerformance(c.Context(), middleware.CompanyID(c))
+	period, err := parseReportPeriod(c)
+	if err != nil {
+		return h.respondError(c, err)
+	}
+	rows, err := h.service.CampaignPerformance(c.Context(), middleware.CompanyID(c), period)
 	if err != nil {
 		return h.respondError(c, err)
 	}

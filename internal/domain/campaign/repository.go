@@ -3,6 +3,7 @@ package campaign
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -38,7 +39,9 @@ type Repository interface {
 	// candidatos cuja fase atual está nesta posição do funil ou adiante, nunca uma contagem
 	// exata "quem está sentado aqui agora". Ver PhaseCount no model.go pro porquê.
 	PhaseCountsByCampaign(ctx context.Context, companyID, campaignID string) ([]PhaseCount, error)
-	PhaseCountsByCompany(ctx context.Context, companyID string) ([]PhaseCount, error)
+	// PhaseCountsByCompany recorta por período de CANDIDATURA (ver ReportPeriod); o zero value
+	// não recorta nada, que é o que a tela de Campanhas usa.
+	PhaseCountsByCompany(ctx context.Context, companyID string, period ReportPeriod) ([]PhaseCount, error)
 	// HiredCount só é relevante pra campanhas encerradas (usado no texto de `meta`) — ninguém
 	// ainda produz esse estado nesta versão, então é sempre chamado sob demanda, não em massa.
 	HiredCount(ctx context.Context, companyID, campaignID string) (int, error)
@@ -292,11 +295,26 @@ func (r *postgresRepository) PhaseCountsByCampaign(ctx context.Context, companyI
 	`, companyID, campaignID)
 }
 
-func (r *postgresRepository) PhaseCountsByCompany(ctx context.Context, companyID string) ([]PhaseCount, error) {
-	return r.queryPhaseCounts(ctx, phaseCountsQuery+`
+func (r *postgresRepository) PhaseCountsByCompany(ctx context.Context, companyID string, period ReportPeriod) ([]PhaseCount, error) {
+	args := []any{companyID}
+	// O recorte entra no ON do left join, NÃO num where: no where, uma campanha sem nenhuma
+	// candidatura no período sairia da lista inteira (o left join produz linha com c.* nulo, que
+	// o where descartaria). No ON, ela continua aparecendo com contagem zero — que é a resposta
+	// certa pra "esta campanha não recebeu ninguém neste mês".
+	filter := ""
+	if period.From != nil {
+		args = append(args, *period.From)
+		filter += fmt.Sprintf(" and c.created_at >= $%d", len(args))
+	}
+	if period.To != nil {
+		args = append(args, *period.To)
+		filter += fmt.Sprintf(" and c.created_at < $%d", len(args))
+	}
+
+	return r.queryPhaseCounts(ctx, phaseCountsQuery+filter+`
 		group by target.campaign_id, target.phase_key, target.position
 		order by target.campaign_id, target.position
-	`, companyID)
+	`, args...)
 }
 
 func (r *postgresRepository) HiredCount(ctx context.Context, companyID, campaignID string) (int, error) {
