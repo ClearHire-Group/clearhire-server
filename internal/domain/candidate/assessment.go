@@ -76,6 +76,12 @@ func (s *service) Assess(ctx context.Context, companyID, id string) (*AIAssessme
 		return nil, apperror.BadRequest("este candidato já teve uma decisão final registrada")
 	}
 
+	// Perfil sem nada pra avaliar: pular a chamada, nunca chega a valer a pena gastar nela (ver
+	// isProfileTooThinToAssess).
+	if isProfileTooThinToAssess(d) {
+		return s.assessInsufficientProfile(ctx, d)
+	}
+
 	version := s.assessor.PromptVersion()
 	existing, err := s.repo.FindAssessmentVersion(ctx, id, d.PhaseKey, version)
 	if err != nil {
@@ -209,6 +215,61 @@ func mapAssessmentError(err error) error {
 	default:
 		return apperror.Internal("falha ao gerar análise")
 	}
+}
+
+// insufficientProfilePromptVersion identifica avaliações que nunca chegaram a chamar o provedor de
+// IA — versão própria, nunca a do assessor real (s.assessor.PromptVersion()), por dois motivos: (a)
+// nunca colide com uma avaliação de verdade no unique de (candidato, fase, prompt_version); (b) se o
+// perfil for enriquecido depois (reextração, edição manual), uma chamada nova a Assess vê que o
+// prompt_version salvo não é mais o que isProfileTooThinToAssess produziria e tenta de novo — dessa
+// vez com o assessor de verdade.
+const insufficientProfilePromptVersion = "assessment-insufficient-profile-v1"
+
+// isProfileTooThinToAssess é o guard-rail de custo mais barato que existe: chamar a IA para um
+// perfil sem resumo, formação, experiência, skills NEM anos de experiência só paga por uma resposta
+// que já se sabe de graça ("sem dado pra avaliar"). Comum em candidatura manual com só nome/e-mail
+// preenchidos, ou currículo do qual a extração não aproveitou nada. Não é o filtro de estágio 1
+// cogitado no plano de IA (campaign_match_criteria, que reprovaria por não bater com a VAGA) — este
+// nunca reprova ninguém, só evita uma chamada cujo resultado já é certo antes de perguntar.
+func isProfileTooThinToAssess(d *CandidateDetail) bool {
+	return d.Summary == "" &&
+		d.EducationDegree == "" &&
+		d.EducationInstitution == "" &&
+		len(d.Experience) == 0 &&
+		len(d.Skills) == 0 &&
+		(d.YearsExperience == nil || *d.YearsExperience == 0)
+}
+
+// assessInsufficientProfile grava, sem chamar o provedor, o mesmo estado 'insuficiente' que o
+// assessor real usa quando não há evidência pra concluir (ver AIAssessment.Confidence) — aqui a
+// decisão é determinística porque não há NADA no perfil, então nem vale gastar a chamada pra
+// descobrir isso. Idempotente do mesmo jeito que runAssessment (unique de SaveAssessment cobre a
+// corrida entre duas requisições simultâneas).
+func (s *service) assessInsufficientProfile(ctx context.Context, d *CandidateDetail) (*AIAssessment, error) {
+	if existing, err := s.repo.FindAssessmentVersion(ctx, d.ID, d.PhaseKey, insufficientProfilePromptVersion); err != nil {
+		return nil, apperror.Internal("falha ao consultar avaliação")
+	} else if existing != nil {
+		return existing, nil
+	}
+
+	assessment := &llm.Assessment{
+		Confidence:         "insuficiente",
+		MissingInformation: []string{"Nenhuma informação de currículo, formação, experiência ou skills foi preenchida ou extraída."},
+	}
+	origin := AssessmentOrigin{Provider: "deterministic", PromptVersion: insufficientProfilePromptVersion}
+	err := s.withTx(ctx, func(db database.DB) error {
+		_, saveErr := s.newTxRepo(db).SaveAssessment(ctx, d.ID, d.PhaseKey, assessment, origin)
+		return saveErr
+	})
+	if err != nil {
+		return nil, apperror.Internal("falha ao registrar avaliação")
+	}
+
+	stored, err := s.repo.FindAssessmentVersion(ctx, d.ID, d.PhaseKey, insufficientProfilePromptVersion)
+	if err != nil || stored == nil {
+		return nil, apperror.Internal("falha ao consultar avaliação")
+	}
+	return stored, nil
 }
 
 func (s *service) newTxRepo(db database.DB) Repository {
