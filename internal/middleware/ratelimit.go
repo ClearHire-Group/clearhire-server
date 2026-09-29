@@ -33,6 +33,26 @@ func RateLimit(max int, expiration time.Duration) fiber.Handler {
 // É um limite grosseiro de contenção, não de justiça: ele deve ficar bem acima do tráfego legítimo
 // esperado, porque quando dispara também recusa candidato de verdade. O controle fino de custo é o
 // teto de orçamento por empresa (ver migrations/0009); este aqui é o disjuntor.
+// RouteParamRateLimit conta por VALOR de um parâmetro de rota — hoje, por campanha.
+//
+// É o balde do meio que faltava nas rotas anônimas: o limite por IP contém uma origem insistente e
+// o global contém o ataque distribuído, mas só esses dois deixam um apagão cruzado entre empresas.
+// Bastavam ~24 origens inundando UMA campanha para o balde global estourar e o formulário público
+// de TODAS as empresas passar a responder 429. Com este limite no meio, a campanha inundada é
+// cortada antes de consumir a cota que é de todo mundo.
+func RouteParamRateLimit(param string, max int, expiration time.Duration) fiber.Handler {
+	return limiter.New(limiter.Config{
+		Max:        max,
+		Expiration: expiration,
+		KeyGenerator: func(c *fiber.Ctx) string {
+			return param + ":" + c.Params(param)
+		},
+		LimitReached: func(c *fiber.Ctx) error {
+			return response.Err(c, fiber.StatusTooManyRequests, "muitas candidaturas para esta vaga agora, tente novamente em instantes")
+		},
+	})
+}
+
 func GlobalRateLimit(max int, expiration time.Duration) fiber.Handler {
 	return limiter.New(limiter.Config{
 		Max:        max,

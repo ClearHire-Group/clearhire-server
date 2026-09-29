@@ -22,6 +22,13 @@ const (
 	ProviderAnthropic     = "anthropic"
 )
 
+// EnvDevelopment é o único valor que afrouxa proteções (ver Env em Load e IsDevelopment); qualquer
+// outro valor, inclusive vazio ou digitado errado, é tratado como produção.
+const (
+	EnvDevelopment = "development"
+	EnvProduction  = "production"
+)
+
 type Config struct {
 	Env         string
 	Port        string
@@ -57,7 +64,14 @@ func Load() (*Config, error) {
 	_ = godotenv.Load() // ausência de .env não é erro — produção não tem esse arquivo
 
 	cfg := &Config{
-		Env:             getEnv("APP_ENV", "development"),
+		// Default PRODUÇÃO, de propósito. `development` liga quatro coisas de uma vez (cookie sem
+		// Secure, link de reset e de convite devolvidos na resposta HTTP, e JWT_SECRET fraco só
+		// avisando em vez de recusar a subida). Se isso fosse o default, esquecer a variável no
+		// deploy entregaria redefinição de senha de qualquer empresa a um anônimo. O modo inseguro
+		// tem que ser escolha explícita de quem roda local, nunca o que acontece por omissão.
+		// getEnvOrDefault (e não getEnv): `APP_ENV=` vazio, que acontece em plataforma que exporta
+		// variável em branco, tem que virar produção de verdade, não a string vazia.
+		Env:             getEnvOrDefault("APP_ENV", EnvProduction),
 		Port:            getEnv("APP_PORT", "8080"),
 		DatabaseURL:     getEnv("DATABASE_URL", ""),
 		JWTSecret:       getEnv("JWT_SECRET", ""),
@@ -147,12 +161,19 @@ func splitList(s string) []string {
 // forjáveis. O placeholder do .env.example é rejeitado sempre, mesmo em dev
 // (é um erro barato de pegar); o comprimento mínimo só é obrigatório fora de
 // dev, pra não travar quem está só rodando local com um valor curto.
+// IsDevelopment é o único lugar que decide o que conta como ambiente de desenvolvimento. Compara
+// com o valor exato: `dev`, `Development` ou um typo qualquer caem em produção, que é o lado seguro
+// de errar.
+func (c *Config) IsDevelopment() bool {
+	return c.Env == EnvDevelopment
+}
+
 func (c *Config) validateJWTSecret() error {
 	if c.JWTSecret == "changeme" {
 		return fmt.Errorf("JWT_SECRET ainda é o valor placeholder do .env.example — defina um segredo real")
 	}
 	if len(c.JWTSecret) < minJWTSecretLen {
-		if c.Env != "development" {
+		if !c.IsDevelopment() {
 			return fmt.Errorf("JWT_SECRET ausente ou curto demais (mínimo %d caracteres) para APP_ENV=%s", minJWTSecretLen, c.Env)
 		}
 		log.Printf("aviso: JWT_SECRET fraco ou ausente (%d caracteres) — aceitável em development, nunca em produção", len(c.JWTSecret))

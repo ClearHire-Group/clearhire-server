@@ -1,8 +1,11 @@
 package llm
 
 import (
+	"bytes"
+	"compress/zlib"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -132,6 +135,60 @@ func TestValidatePDFRejectsTooManyPages(t *testing.T) {
 	}
 	if err := ValidatePDF(pdfWithPages(MaxPDFPages + 1)); !errors.Is(err, ErrPDFTooLong) {
 		t.Errorf("erro = %v, esperava ErrPDFTooLong", err)
+	}
+}
+
+// bombPDF monta um PDF pequeno cujo stream FlateDecode explode ao ser descomprimido. Zeros
+// comprimem em ordens de grandeza, que é exatamente o que um atacante usa: o arquivo enviado é
+// minúsculo e o conteúdo descomprimido não cabe na memória do processo.
+func bombPDF(t *testing.T, decompressedBytes int) []byte {
+	t.Helper()
+	var compressed bytes.Buffer
+	zw := zlib.NewWriter(&compressed)
+	if _, err := io.Copy(zw, io.LimitReader(zeroReader{}, int64(decompressedBytes))); err != nil {
+		t.Fatalf("comprimindo a bomba: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("fechando o compressor: %v", err)
+	}
+
+	var b bytes.Buffer
+	b.WriteString("%PDF-1.4\n1 0 obj\n<< /Length ")
+	fmt.Fprintf(&b, "%d /Filter /FlateDecode >>\nstream\n", compressed.Len())
+	b.Write(compressed.Bytes())
+	b.WriteString("\nendstream\nendobj\ntrailer\n<< /Size 1 >>\n%%EOF\n")
+	return b.Bytes()
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 0
+	}
+	return len(p), nil
+}
+
+// O achado da auditoria de segurança: um PDF de poucos KB, declarando UMA página, descomprimia sem
+// teto e podia consumir gigabytes — derrubando o processo inteiro a partir de uma rota anônima.
+// Nem o limite de páginas nem o de bytes do upload pegavam isso (ver MaxPDFDecompressedBytes).
+func TestValidatePDFRejectsDecompressionBomb(t *testing.T) {
+	bomb := bombPDF(t, MaxPDFDecompressedBytes*3)
+
+	if len(bomb) > 1<<20 {
+		t.Fatalf("a bomba deveria ser pequena comprimida, tem %d bytes", len(bomb))
+	}
+	if err := ValidatePDF(bomb); !errors.Is(err, ErrPDFBomb) {
+		t.Errorf("erro = %v, esperava ErrPDFBomb", err)
+	}
+}
+
+// A guarda não pode recusar currículo de verdade: o fixture real tem que continuar passando (já
+// coberto por TestValidatePDFAcceptsRealResume) e um stream comprimido comum também.
+func TestValidatePDFAcceptsNormalCompressedStream(t *testing.T) {
+	ok := bombPDF(t, 64<<10) // 64 KB descomprimidos: tamanho de currículo de verdade
+	if err := ValidatePDF(ok); errors.Is(err, ErrPDFBomb) {
+		t.Errorf("stream comum recusado como bomba: %v", err)
 	}
 }
 

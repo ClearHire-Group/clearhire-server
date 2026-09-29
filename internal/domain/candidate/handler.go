@@ -28,6 +28,11 @@ const maxResumeFileBytes = 5 * 1024 * 1024
 const (
 	publicApplicationsPerMinute = 120
 	resumeFilesPerMinute        = 60
+	// Por campanha: uma vaga real recebendo 40 candidaturas em um único minuto já é excepcional,
+	// então isto não estorva ninguém — serve para a inundação de UMA vaga ser cortada antes de
+	// consumir o balde global, que é compartilhado por todas as empresas (ver RouteParamRateLimit).
+	applicationsPerCampaignPerMinute = 40
+	resumeFilesPerCampaignPerMinute  = 20
 )
 
 type Handler struct {
@@ -67,11 +72,13 @@ func (h *Handler) RegisterPublicRoutes(router fiber.Router) {
 	// chamada paga. Sem o global, N origens passam N vezes pelo limite por IP sem encostar nele.
 	// O teto por minuto está bem acima do tráfego legítimo de uma campanha; é disjuntor, não cota.
 	group.Post("/", middleware.GlobalRateLimit(publicApplicationsPerMinute, time.Minute),
+		middleware.RouteParamRateLimit("id", applicationsPerCampaignPerMinute, time.Minute),
 		middleware.RateLimit(5, time.Minute), h.SubmitApplication)
 	// Upload de PDF: limite mais apertado por processar um arquivo (parsing tem custo de CPU
 	// mesmo sendo determinístico, sem chamada de IA nenhuma — ver pkg/llm/deterministic); rota
 	// própria já facilita isolar o limite sem afetar o modo texto/manual.
 	group.Post("/resume-file", middleware.GlobalRateLimit(resumeFilesPerMinute, time.Minute),
+		middleware.RouteParamRateLimit("id", resumeFilesPerCampaignPerMinute, time.Minute),
 		middleware.RateLimit(3, time.Minute), h.SubmitResumeFile)
 }
 

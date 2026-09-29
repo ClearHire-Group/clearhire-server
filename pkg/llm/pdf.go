@@ -2,6 +2,7 @@ package llm
 
 import (
 	"bytes"
+	"compress/zlib"
 	"errors"
 	"fmt"
 	"io"
@@ -22,11 +23,63 @@ const MaxResumeTextChars = 14000
 // o pior caso de custo é um PDF válido, dentro do limite de bytes, com centenas de páginas.
 const MaxPDFPages = 15
 
+// MaxPDFDecompressedBytes é o teto de bytes que os streams comprimidos do PDF podem produzir
+// somados. Existe por causa de bomba de descompressão: um PDF de meio megabyte, declarando UMA
+// página, pode carregar um stream FlateDecode que explode em gigabytes ao ser descomprimido.
+//
+// Nenhuma das outras defesas pega isso, e cada uma por um motivo diferente:
+//   - MaxPDFPages limita PÁGINAS, e a bomba cabe numa página só;
+//   - o teto de bytes do upload limita o arquivo COMPRIMIDO, que é justamente o lado pequeno;
+//   - o io.LimitReader de ExtractPDFText corta o texto DEPOIS de a biblioteca já ter montado tudo
+//     em memória (GetPlainText devolve um bytes.Buffer pronto, não um reader preguiçoso);
+//   - recover() não salva: estouro de memória no Go é fatal, não é panic que dê para capturar.
+//
+// 50 MB é folgado demais para qualquer currículo real (os streams de um currículo de 5 páginas dão
+// alguns poucos MB) e pequeno o bastante para não derrubar o processo.
+const MaxPDFDecompressedBytes = 50 << 20
+
 var (
 	ErrNotPDF        = errors.New("llm: arquivo não é um PDF")
 	ErrPDFTooLong    = errors.New("llm: PDF com páginas demais para um currículo")
 	ErrPDFUnreadable = errors.New("llm: PDF corrompido ou ilegível")
+	// ErrPDFBomb é entrada hostil, não arquivo defeituoso — vale distinguir de ErrPDFUnreadable no
+	// log, mesmo que para quem enviou as duas mensagens sejam a mesma coisa.
+	ErrPDFBomb = errors.New("llm: PDF expande além do limite ao ser descomprimido")
 )
+
+var streamStart = []byte("stream")
+
+// checkDecompressionBomb descomprime os streams do PDF por conta própria, com teto, ANTES de a
+// biblioteca ter a chance de fazer isso sem teto. Descarta os bytes conforme lê (io.Discard): o
+// custo é CPU limitada, nunca memória proporcional ao conteúdo.
+//
+// Varre os bytes crus procurando os blocos `stream`/`endstream` em vez de interpretar a estrutura
+// do PDF, de propósito: interpretar exigiria confiar no mesmo parser do qual estamos nos
+// defendendo. Um stream que não seja zlib é ignorado (não é o vetor); o que importa é que NENHUM
+// caminho de descompressão fique sem limite.
+func checkDecompressionBomb(data []byte) error {
+	remaining := int64(MaxPDFDecompressedBytes)
+	for offset := 0; ; {
+		i := bytes.Index(data[offset:], streamStart)
+		if i < 0 {
+			return nil
+		}
+		body := data[offset+i+len(streamStart):]
+		// A spec manda uma quebra de linha logo após a palavra `stream`.
+		body = bytes.TrimLeft(body, "\r\n")
+
+		if zr, err := zlib.NewReader(bytes.NewReader(body)); err == nil {
+			// remaining+1: se conseguir ler um byte a mais que o permitido, estourou.
+			n, _ := io.Copy(io.Discard, io.LimitReader(zr, remaining+1))
+			zr.Close()
+			if n > remaining {
+				return ErrPDFBomb
+			}
+			remaining -= n
+		}
+		offset += i + len(streamStart)
+	}
+}
 
 // ValidatePDF confere, antes de qualquer processamento ou custo, que os bytes são mesmo um PDF e
 // têm um número razoável de páginas. Vem do upload anônimo, então nada aqui confia no nome ou no
@@ -43,6 +96,11 @@ func ValidatePDF(data []byte) (err error) {
 	}
 	if !bytes.Contains(head, []byte("%PDF-")) {
 		return ErrNotPDF
+	}
+
+	// ANTES de pdf.NewReader: a partir daqui quem descomprime é a biblioteca, sem teto nenhum.
+	if err := checkDecompressionBomb(data); err != nil {
+		return err
 	}
 
 	// O parser roda sobre entrada hostil e já entrou em pânico com PDFs malformados em outros

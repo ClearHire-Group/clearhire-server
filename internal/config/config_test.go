@@ -124,6 +124,73 @@ func TestInvalidConcurrencyRefusesToBoot(t *testing.T) {
 }
 
 // Padrão seguro: só o loopback é proxy confiável, e o header é o que o nginx do projeto sobrescreve.
+// Achado de auditoria de segurança: o default era "development", e development libera quatro
+// coisas de uma vez — cookie sem Secure, link de reset e token de convite devolvidos na resposta
+// HTTP, e JWT_SECRET fraco apenas avisando. Esquecer APP_ENV no deploy entregaria a redefinição de
+// senha de qualquer empresa a um anônimo. Esquecer a variável tem que resultar no lado SEGURO.
+func TestMissingAppEnvDefaultsToProduction(t *testing.T) {
+	setBase(t)
+	t.Setenv("APP_ENV", "")
+
+	cfg, err := Load()
+
+	if err != nil {
+		t.Fatalf("erro: %v", err)
+	}
+	if cfg.Env != EnvProduction {
+		t.Errorf("APP_ENV ausente resolveu para %q, esperava %q", cfg.Env, EnvProduction)
+	}
+	if cfg.IsDevelopment() {
+		t.Error("APP_ENV ausente não pode contar como desenvolvimento")
+	}
+}
+
+// Só o valor exato afrouxa proteção: um typo ("dev", "Development", "prod") cai em produção.
+func TestOnlyExactDevelopmentLoosensProtections(t *testing.T) {
+	for _, value := range []string{"dev", "Development", "DEVELOPMENT", "prod", "staging"} {
+		t.Run(value, func(t *testing.T) {
+			setBase(t)
+			t.Setenv("APP_ENV", value)
+
+			cfg, err := Load()
+
+			if err != nil {
+				t.Fatalf("erro: %v", err)
+			}
+			if cfg.IsDevelopment() {
+				t.Errorf("APP_ENV=%q foi tratado como desenvolvimento", value)
+			}
+		})
+	}
+}
+
+// E o caminho legítimo continua funcionando: quem roda local pede development explicitamente.
+func TestExplicitDevelopmentIsHonored(t *testing.T) {
+	setBase(t)
+	t.Setenv("APP_ENV", EnvDevelopment)
+
+	cfg, err := Load()
+
+	if err != nil {
+		t.Fatalf("erro: %v", err)
+	}
+	if !cfg.IsDevelopment() {
+		t.Error("APP_ENV=development deveria ligar o modo de desenvolvimento")
+	}
+}
+
+// JWT_SECRET curto é só aviso em development, mas tem que RECUSAR a subida em produção — e agora
+// produção é o default, então esta é a rede que pega um deploy sem segredo configurado.
+func TestWeakSecretRefusesToBootOutsideDevelopment(t *testing.T) {
+	setBase(t)
+	t.Setenv("APP_ENV", "")
+	t.Setenv("JWT_SECRET", "curto-demais")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("esperava recusa de boot com JWT_SECRET fraco fora de development")
+	}
+}
+
 func TestProxyDefaultsAreSafe(t *testing.T) {
 	setBase(t)
 

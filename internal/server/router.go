@@ -20,7 +20,7 @@ func RegisterRoutes(app *fiber.App, f *factory.Factory, cfg *config.Config) {
 	f.CampaignHandler.RegisterPublicRoutes(v1)
 	f.CandidateHandler.RegisterPublicRoutes(v1)
 
-	protected := v1.Group("", middleware.Auth(cfg.JWTSecret), middleware.Tenant())
+	protected := v1.Group("", middleware.Auth(cfg.JWTSecret, f.IsUserActive), middleware.Tenant())
 	f.CompanyHandler.RegisterProfileRoutes(protected)
 	f.UserHandler.RegisterRoutes(protected)
 	f.CampaignHandler.RegisterRoutes(protected)

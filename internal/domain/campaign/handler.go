@@ -34,8 +34,13 @@ func (h *Handler) RegisterRoutes(router fiber.Router) {
 
 // RegisterPublicRoutes pluga a única leitura sem tenant deste domínio — GET /public/campaigns/:id,
 // chamada pelo candidato anônimo antes de se candidatar. Mesmo padrão de company.Handler.RegisterPublicRoutes.
+// Era a única rota anônima sem limite nenhum: cada chamada vai ao Postgres, e o id é UUID (não dá
+// para enumerar campanha por força bruta), então o risco não é vazamento e sim inundação.
 func (h *Handler) RegisterPublicRoutes(router fiber.Router) {
-	router.Group("/public/campaigns").Get("/:id", h.GetPublicInfo)
+	router.Group("/public/campaigns",
+		middleware.GlobalRateLimit(600, time.Minute),
+		middleware.RateLimit(60, time.Minute),
+	).Get("/:id", h.GetPublicInfo)
 }
 
 // RegisterReportsRoutes pluga os agregados que a tela Relatórios consome — moram aqui porque
