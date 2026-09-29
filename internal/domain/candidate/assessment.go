@@ -272,6 +272,95 @@ func (s *service) assessInsufficientProfile(ctx context.Context, d *CandidateDet
 	return stored, nil
 }
 
+// AssessTalentForCampaign é a etapa 2 do match reverso (documentos/banco-de-talentos-recomendacao-
+// plano.md): leitura qualitativa da IA sobre UM talento do Banco de Talentos contra a vaga de uma
+// campanha real — sempre uma chamada explícita do recrutador sobre um recorte pequeno (ver
+// talent.Service.AssessForCampaign, que impõe o teto), nunca automática sobre o banco inteiro.
+//
+// Mesmo Assessor, mesmo orçamento mensal, mesma sanitização de saída e mesma idempotência de
+// Assess (acima) — a diferença é só a origem do perfil (llm.CandidateContext já pronto, não
+// construído de um CandidateDetail) e onde a avaliação é lida/gravada
+// (campaign_talent_recommendations, não candidate_ai_assessments). Não há StageFocus nem
+// PriorStageSummary: recomendação de banco não tem "fase anterior" a comparar.
+func (s *service) AssessTalentForCampaign(ctx context.Context, companyID, campaignID, talentID string, profile llm.CandidateContext) (*llm.Assessment, error) {
+	if s.assessor == nil {
+		return nil, apperror.Unavailable("a análise por IA não está habilitada neste ambiente")
+	}
+
+	job, err := s.repo.FindJobContext(ctx, companyID, campaignID)
+	if err != nil {
+		return nil, apperror.Internal("falha ao buscar vaga")
+	}
+	if job == nil {
+		return nil, apperror.NotFound("vaga não encontrada")
+	}
+
+	version := s.assessor.PromptVersion()
+	existing, err := s.repo.FindTalentRecommendation(ctx, companyID, campaignID, talentID, version)
+	if err != nil {
+		return nil, apperror.Internal("falha ao consultar avaliação")
+	}
+	if existing != nil {
+		return existing, nil
+	}
+
+	// Mesmo teto mensal de Assess/extração — um caminho de gasto só, nunca um segundo que o
+	// orçamento não enxerga.
+	if err := s.checkBudget(ctx, companyID); err != nil {
+		s.recordTalentMatchUsage(ctx, companyID, campaignID, llm.Free(budgetProvider), llmusage.StatusFailed, err.Error())
+		return nil, mapAssessmentError(err)
+	}
+
+	assessment, usage, err := s.assessor.Assess(ctx, llm.AssessInput{Job: *job, Candidate: profile})
+	if err != nil {
+		status := llmusage.StatusFailed
+		if usage.InputTokens > 0 || usage.OutputTokens > 0 {
+			status = llmusage.StatusBilledError
+		}
+		s.recordTalentMatchUsage(ctx, companyID, campaignID, usage, status, err.Error())
+		return nil, mapAssessmentError(err)
+	}
+	s.recordTalentMatchUsage(ctx, companyID, campaignID, usage, llmusage.StatusSuccess, "")
+
+	// Mesma entrada não confiável de sempre: o texto do perfil do talento pode ter sido manipulado
+	// (currículo colado com instrução embutida) tanto quanto o de um candidato de verdade.
+	llm.SanitizeAssessment(assessment)
+
+	origin := AssessmentOrigin{Provider: usage.Provider, Model: usage.Model, PromptVersion: version}
+	saved, err := s.repo.SaveTalentRecommendation(ctx, companyID, campaignID, talentID, assessment, origin)
+	if err != nil {
+		return nil, apperror.Internal("falha ao registrar avaliação")
+	}
+	if saved {
+		return assessment, nil
+	}
+
+	// Perdeu a corrida: outra requisição gravou primeiro (duplo clique) — relê o que ficou, é o
+	// mesmo que qualquer leitura seguinte vai mostrar.
+	stored, err := s.repo.FindTalentRecommendation(ctx, companyID, campaignID, talentID, version)
+	if err != nil || stored == nil {
+		return nil, apperror.Internal("falha ao consultar avaliação")
+	}
+	return stored, nil
+}
+
+// recordTalentMatchUsage é o recordUsage/recordAssessmentUsage de OperationTalentMatch — trilha
+// separada de propósito (ver llmusage.OperationTalentMatch) pra não misturar, no relatório de
+// custo, avaliar candidato no funil com avaliar talento do banco pra vaga nova.
+func (s *service) recordTalentMatchUsage(ctx context.Context, companyID, campaignID string, usage llm.Usage, status, errCode string) {
+	if s.usage == nil {
+		return
+	}
+	_ = s.usage.Record(ctx, &llmusage.Record{
+		CompanyID:  companyID,
+		CampaignID: &campaignID,
+		Operation:  llmusage.OperationTalentMatch,
+		Usage:      usage,
+		Status:     status,
+		ErrorCode:  errCode,
+	})
+}
+
 func (s *service) newTxRepo(db database.DB) Repository {
 	if s.txRepo != nil {
 		return s.txRepo(db)

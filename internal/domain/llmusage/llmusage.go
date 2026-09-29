@@ -20,6 +20,12 @@ const (
 
 	OperationExtraction = "extraction"
 	OperationAssessment = "assessment"
+	// OperationTalentMatch é a leitura de IA sob demanda do match reverso (etapa 2 do documento
+	// documentos/banco-de-talentos-recomendacao-plano.md) — deliberadamente separada de
+	// OperationAssessment: são gastos de propósito diferente (avaliar candidato já no funil vs.
+	// avaliar talento do banco pra vaga nova), e misturar os dois no relatório de custo por
+	// operação esconderia de onde o gasto realmente vem.
+	OperationTalentMatch = "talent_match"
 )
 
 // Record é uma chamada (ou uma economia, no caso de cache_hit). CampaignID e CandidateID são

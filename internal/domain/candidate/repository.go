@@ -58,6 +58,18 @@ type Repository interface {
 	// informada, ou nil, nil se esta é a primeira fase avaliada — usada pra dar à IA um resumo
 	// curto do que já se sabia, em vez de reavaliar do zero (ver assessment.go, buildAssessInput).
 	PriorStageAssessment(ctx context.Context, candidateID, excludePhaseKey string) (*AIAssessment, string, error)
+	// FindTalentRecommendation/SaveTalentRecommendation são o mesmo padrão de FindAssessmentVersion/
+	// SaveAssessment acima, só que para campaign_talent_recommendations (etapa 2 do match reverso —
+	// ver documentos/banco-de-talentos-recomendacao-plano.md). Moram aqui, não em talent/repository.go,
+	// porque são o mesmo Assessor/orçamento/idempotência de AssessTalentForCampaign — a tabela é
+	// escrita por quem já segura a conexão com o provedor de IA, mesmo raciocínio que já levou
+	// campaign.Repository a escrever direto em `candidates` (ver CreateCandidatesFromTalents):
+	// SQL cruza domínio quando o dado é o mesmo banco Postgres e inventar plumbing Go só pra evitar
+	// isso não compraria nada.
+	FindTalentRecommendation(ctx context.Context, companyID, campaignID, talentID, promptVersion string) (*llm.Assessment, error)
+	// SaveTalentRecommendation devolve false quando outra requisição já gravou a mesma
+	// (campanha, talento, versão) — mesma corrida que SaveAssessment já resolve pra candidato.
+	SaveTalentRecommendation(ctx context.Context, companyID, campaignID, talentID string, a *llm.Assessment, origin AssessmentOrigin) (bool, error)
 	// AdvancePhase mata dois coelhos numa Exec só: move o candidato pra nextPhaseKey e já ajusta o
 	// status pro que faz sentido na fase nova. Devolve false se o candidato não existe/não é desta
 	// empresa (0 linhas afetadas).
@@ -431,6 +443,57 @@ func (r *postgresRepository) SaveAssessment(ctx context.Context, candidateID, ph
 		update candidates set status = 'aguardando_decisao'
 		where id = $1 and status = 'aguardando_triagem_ia'
 	`, candidateID); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (r *postgresRepository) FindTalentRecommendation(ctx context.Context, companyID, campaignID, talentID, promptVersion string) (*llm.Assessment, error) {
+	var a llm.Assessment
+	var matchLabel, matchNote, justification *string
+	row := r.db.QueryRow(ctx, `
+		select match_pct, match_label, match_note, justification, strengths, concerns,
+		       confidence, missing_information
+		from campaign_talent_recommendations
+		where campaign_id = $1 and talent_id = $2 and prompt_version = $3 and company_id = $4
+		limit 1
+	`, campaignID, talentID, promptVersion, companyID)
+	err := row.Scan(&a.MatchPct, &matchLabel, &matchNote, &justification, &a.Strengths, &a.Concerns,
+		&a.Confidence, &a.MissingInformation)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if matchLabel != nil {
+		a.MatchLabel = *matchLabel
+	}
+	if matchNote != nil {
+		a.MatchNote = *matchNote
+	}
+	if justification != nil {
+		a.Justification = *justification
+	}
+	return &a, nil
+}
+
+func (r *postgresRepository) SaveTalentRecommendation(ctx context.Context, companyID, campaignID, talentID string, a *llm.Assessment, origin AssessmentOrigin) (bool, error) {
+	var id string
+	err := r.db.QueryRow(ctx, `
+		insert into campaign_talent_recommendations
+			(company_id, campaign_id, talent_id, match_pct, match_label, match_note, justification,
+			 strengths, concerns, confidence, missing_information, provider, model, prompt_version)
+		values ($1, $2, $3, $4, nullif($5, ''), nullif($6, ''), nullif($7, ''), $8, $9, $10, $11, $12, $13, $14)
+		on conflict (campaign_id, talent_id, prompt_version) do nothing
+		returning id
+	`, companyID, campaignID, talentID, a.MatchPct, a.MatchLabel, a.MatchNote, a.Justification,
+		a.Strengths, a.Concerns, a.Confidence, a.MissingInformation, origin.Provider, origin.Model, origin.PromptVersion).
+		Scan(&id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil // conflito: outra requisição gravou primeiro
+		}
 		return false, err
 	}
 	return true, nil

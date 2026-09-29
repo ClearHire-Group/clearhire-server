@@ -3,10 +3,12 @@ package talent
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/ClearHire-Group/clearhire-server/internal/database"
+	"github.com/ClearHire-Group/clearhire-server/pkg/skillmatch"
 )
 
 // Repository só LÊ o banco de talentos (mais a transição de consentimento do primeiro contato). Toda
@@ -22,6 +24,16 @@ type Repository interface {
 	// talento não existe no banco desta empresa.
 	MarkFirstContact(ctx context.Context, companyID, id string) (bool, error)
 	Coverage(ctx context.Context, companyID string) ([]CoverageEntry, error)
+	// ResolveSkillTermsInText e ResolveSectorInText resolvem texto livre (hoje, o título da vaga)
+	// contra a taxonomia GLOBAL (skills/skill_synonyms/sectors — não escopada por empresa, é ativo
+	// do produto que atravessa clientes, ver migrations/0001). Usadas pelo match reverso
+	// (reversematch.go) pra transformar "vaga de Go pleno" em critérios estruturados sem precisar
+	// de LLM — mesmo princípio de FindSkillMentionsInText em candidate/repository.go, mas sem
+	// import cruzado entre os dois domínios.
+	ResolveSkillTermsInText(ctx context.Context, text string) ([]string, error)
+	// ResolveSectorInText devolve "" quando nenhum setor conhecido aparece no texto — ausência de
+	// sinal, não erro.
+	ResolveSectorInText(ctx context.Context, text string) (string, error)
 }
 
 type postgresRepository struct {
@@ -242,4 +254,61 @@ func (r *postgresRepository) Coverage(ctx context.Context, companyID string) ([]
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+func (r *postgresRepository) ResolveSkillTermsInText(ctx context.Context, text string) ([]string, error) {
+	// União de termo canônico + sinônimo, igual candidate/repository.go:FindSkillMentionsInText —
+	// devolve o termo CANÔNICO mesmo quando o sinônimo é o que aparece no texto, porque é o
+	// canônico que casa com talent_skills.term na hora de pontuar o talento.
+	rows, err := r.db.Query(ctx, `
+		select canonical_term::text, canonical_term::text from skills
+		union
+		select sk.canonical_term::text, syn.synonym_text::text
+		from skill_synonyms syn join skills sk on sk.id = syn.skill_id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	lowerText := strings.ToLower(text)
+	seen := make(map[string]bool)
+	var terms []string
+	for rows.Next() {
+		var canonical, mention string
+		if err := rows.Scan(&canonical, &mention); err != nil {
+			return nil, err
+		}
+		if seen[canonical] || mention == "" {
+			continue
+		}
+		if skillmatch.MentionsTerm(text, lowerText, mention) {
+			terms = append(terms, canonical)
+			seen[canonical] = true
+		}
+	}
+	return terms, rows.Err()
+}
+
+func (r *postgresRepository) ResolveSectorInText(ctx context.Context, text string) (string, error) {
+	rows, err := r.db.Query(ctx, `select name::text from sectors`)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	lowerText := strings.ToLower(text)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return "", err
+		}
+		// Setor casa por substring simples (não fronteira de palavra): nomes de setor têm mais de
+		// uma palavra ("produto digital") e a fronteira estrita de mentionsTerm foi desenhada pra
+		// skill curta com símbolo, não pra esse caso.
+		if strings.Contains(lowerText, strings.ToLower(name)) {
+			return name, rows.Err()
+		}
+	}
+	return "", rows.Err()
 }

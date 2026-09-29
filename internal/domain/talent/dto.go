@@ -196,6 +196,84 @@ func outcome(status string, reason *string) string {
 	}
 }
 
+// ReverseMatchRequest é o payload de POST /campaigns/reverse-match — bate 1:1 com o que o frontend
+// já manda (clearhire-app core/data-api.ts, getReverseMatchForNewCampaign): título é o único campo
+// obrigatório (pode ser vaga em rascunho, sem campanha persistida ainda); modalidade, senioridade e
+// requisitos são opcionais. Requirements existe porque título sozinho raramente nomeia skill (ver
+// comentário de MatchCriteria em reversematch.go).
+type ReverseMatchRequest struct {
+	Title        string `json:"title" validate:"required,max=200"`
+	Modality     string `json:"modality" validate:"omitempty,oneof=remoto hibrido presencial"`
+	Seniority    string `json:"seniority" validate:"omitempty,oneof=junior pleno senior"`
+	Requirements string `json:"requirements" validate:"omitempty,max=5000"`
+}
+
+// TalentMatchResponse espelha TalentMatch do frontend (core/models.ts) — o talento no MESMO
+// formato de GET /talents (nunca um segundo shape pro mesmo dado), mais o resultado desta rodada
+// de match especificamente.
+type TalentMatchResponse struct {
+	Talent    *TalentResponse      `json:"talent"`
+	MatchPct  int                  `json:"matchPct"`
+	Breakdown []ScoreBreakdownLine `json:"breakdown"`
+}
+
+func toMatchResponse(m *TalentMatch, now time.Time) *TalentMatchResponse {
+	breakdown := m.Breakdown
+	if breakdown == nil {
+		breakdown = []ScoreBreakdownLine{}
+	}
+	return &TalentMatchResponse{Talent: toResponse(&m.Talent, now), MatchPct: m.MatchPct, Breakdown: breakdown}
+}
+
+// AssessTalentsRequest é o payload de POST /campaigns/:id/talent-recommendations/assess — etapa 2
+// do match reverso. Teto de 5 no validate (espelha maxAssessedTalentsPerRequest em service.go; o
+// service reforça o mesmo teto, então um validate desatualizado nunca abriria brecha, só uma
+// mensagem de erro pior).
+type AssessTalentsRequest struct {
+	TalentIDs []string `json:"talentIds" validate:"required,min=1,max=5,unique,dive,uuid"`
+}
+
+// TalentAssessmentResponse espelha CandidateAssessment do frontend (core/models.ts), sem
+// stageInsight/comparisonFlag: recomendação de banco não tem fase nem avaliação anterior a
+// comparar — só StageFocus/PriorStageSummary vazios do lado do prompt (ver AssessTalentForCampaign).
+type TalentAssessmentResponse struct {
+	MatchPct           int      `json:"matchPct"`
+	MatchLabel         string   `json:"matchLabel"`
+	MatchNote          string   `json:"matchNote"`
+	Strengths          []string `json:"strengths"`
+	Concerns           []string `json:"concerns"`
+	Justification      string   `json:"justification"`
+	Confidence         string   `json:"confidence"`
+	MissingInformation []string `json:"missingInformation"`
+}
+
+type TalentRecommendationResponse struct {
+	Talent     *TalentResponse          `json:"talent"`
+	Assessment TalentAssessmentResponse `json:"assessment"`
+}
+
+func toRecommendationResponse(r *TalentRecommendation, now time.Time) *TalentRecommendationResponse {
+	a := r.Assessment
+	strengths, concerns, missing := a.Strengths, a.Concerns, a.MissingInformation
+	if strengths == nil {
+		strengths = []string{}
+	}
+	if concerns == nil {
+		concerns = []string{}
+	}
+	if missing == nil {
+		missing = []string{}
+	}
+	return &TalentRecommendationResponse{
+		Talent: toResponse(&r.Talent, now),
+		Assessment: TalentAssessmentResponse{
+			MatchPct: a.MatchPct, MatchLabel: a.MatchLabel, MatchNote: a.MatchNote,
+			Strengths: strengths, Concerns: concerns, Justification: a.Justification,
+			Confidence: a.Confidence, MissingInformation: missing,
+		},
+	}
+}
+
 func toResponse(t *Talent, now time.Time) *TalentResponse {
 	years := 0
 	if t.YearsExperience != nil {

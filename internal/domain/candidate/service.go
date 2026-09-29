@@ -42,6 +42,12 @@ type Service interface {
 	Assess(ctx context.Context, companyID, id string) (*AIAssessment, error)
 	// RegisterManualTalent é o cadastro manual de talento — ver manual_talent.go.
 	RegisterManualTalent(ctx context.Context, companyID string, in ManualTalentInput) (string, error)
+	// AssessTalentForCampaign é a implementação de talent.AssessFunc (etapa 2 do match reverso —
+	// ver documentos/banco-de-talentos-recomendacao-plano.md): mesmo Assessor, orçamento,
+	// sanitização e idempotência de Assess, só que para um perfil do Banco de Talentos (não um
+	// Candidate) contra a vaga de uma campanha real. profile já vem pronto (talent.Service monta
+	// a partir do Talent) — este método não conhece o domínio talent, só llm.CandidateContext.
+	AssessTalentForCampaign(ctx context.Context, companyID, campaignID, talentID string, profile llm.CandidateContext) (*llm.Assessment, error)
 }
 
 // duplicateApplicationMessage vai no campo e-mail: é ele que identifica a candidatura (ver

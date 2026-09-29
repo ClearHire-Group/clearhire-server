@@ -30,6 +30,7 @@ func (h *Handler) RegisterRoutes(router fiber.Router) {
 	group.Patch("/:id/phases", h.UpdatePhases)
 	group.Post("/:id/toggle-pause", h.TogglePause)
 	group.Post("/:id/public-application-link", h.SetPublicLink)
+	group.Post("/:id/talents", h.AddTalents)
 }
 
 // RegisterPublicRoutes pluga a única leitura sem tenant deste domínio — GET /public/campaigns/:id,
@@ -159,6 +160,29 @@ func (h *Handler) SetPublicLink(c *fiber.Ctx) error {
 		return h.respondError(c, err)
 	}
 	return response.OK(c, toResponse(view))
+}
+
+// AddTalents pluga o match reverso pós-criação: puxar pro funil um talento que o recrutador já
+// revisou (e, opcionalmente, mandou avaliar pela IA — ver talent.Handler.AssessTalentRecommendations)
+// numa campanha que já existe de verdade.
+func (h *Handler) AddTalents(c *fiber.Ctx) error {
+	id, ok := idparam.Valid(c, "id")
+	if !ok {
+		return nil
+	}
+	var req AddTalentsRequest
+	if err := c.BodyParser(&req); err != nil {
+		return response.Err(c, fiber.StatusBadRequest, "payload inválido")
+	}
+	if err := validator.Validate(req); err != nil {
+		return response.Err(c, fiber.StatusBadRequest, "dados obrigatórios faltando ou inválidos")
+	}
+
+	result, err := h.service.AddTalentsToCampaign(c.Context(), middleware.CompanyID(c), id, req.TalentIDs)
+	if err != nil {
+		return h.respondError(c, err)
+	}
+	return response.OK(c, toAddTalentsResponse(result))
 }
 
 func (h *Handler) GetPublicInfo(c *fiber.Ctx) error {

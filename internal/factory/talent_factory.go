@@ -18,5 +18,8 @@ func InitTalentFactory(db *pgxpool.Pool, candidates candidate.Service) *talent.H
 			Name: in.Name, RawProfileText: in.RawProfileText, ContextNote: in.ContextNote,
 		})
 	}
-	return talent.NewHandler(talent.NewService(talent.NewRepository(db), registerManual))
+	// candidates.AssessTalentForCampaign já tem a assinatura exata de talent.AssessFunc (os dois
+	// falam llm.CandidateContext/llm.Assessment, pacote neutro) — atribuição direta, sem
+	// conversão nenhuma, diferente de registerManual acima.
+	return talent.NewHandler(talent.NewService(talent.NewRepository(db), registerManual, candidates.AssessTalentForCampaign))
 }

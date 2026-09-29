@@ -30,6 +30,18 @@ type PerformanceRow struct {
 	CurrentPhaseKey string
 }
 
+// AddTalentsResult é o retorno de AddTalentsToCampaign — nunca um silêncio sobre uma seleção que o
+// recrutador fez: todo talento pedido aparece em Added ou em Skipped (com o motivo), nunca some
+// sem explicação.
+type AddTalentsResult struct {
+	Added   []string
+	Skipped []SkippedTalent
+}
+
+type SkippedTalent struct {
+	TalentID, Name, Reason string
+}
+
 type Service interface {
 	Get(ctx context.Context, companyID, id string) (*CampaignView, error)
 	List(ctx context.Context, companyID string) ([]CampaignView, error)
@@ -53,6 +65,13 @@ type Service interface {
 	// JWT nenhum. 404 idêntico pra "não existe", "pausada" e "link desligado": nunca diferenciar
 	// pra um chamador anônimo.
 	GetPublicInfo(ctx context.Context, id string) (*PublicInfo, error)
+	// AddTalentsToCampaign puxa talentos do banco pro funil (fase Recebidos) de uma campanha JÁ
+	// CRIADA — a mesma ação que TalentIDs em Create já faz na criação, aqui disponível depois: o
+	// recrutador olhou o match reverso (e, opcionalmente, a leitura de IA — talent.AssessForCampaign)
+	// numa campanha que já existe e decidiu puxar alguém pro funil de verdade. "IA sugere; o humano
+	// decide e executa" (documento de especificação, seção 8.2) — sempre um pedido explícito com
+	// ids escolhidos, nunca automático.
+	AddTalentsToCampaign(ctx context.Context, companyID, campaignID string, talentIDs []string) (*AddTalentsResult, error)
 }
 
 type service struct {
@@ -129,8 +148,17 @@ func (s *service) Create(ctx context.Context, companyID, createdByUserID string,
 	// uma campanha sem nenhuma fase configurada — quebrando a FK que todo candidato dessa
 	// campanha vai depender (campaigns.id, phase_key -> campaign_phases).
 	err := s.withTx(ctx, func(db database.DB) error {
-		if err := NewRepository(db).Create(ctx, c, phases); err != nil {
+		repo := NewRepository(db)
+		if err := repo.Create(ctx, c, phases); err != nil {
 			return err
+		}
+		// Match reverso (documento de especificação, seção 8.2): talentos que o recrutador já
+		// revisou e escolheu puxar entram como candidatos desta campanha, fase Recebidos — na
+		// MESMA transação, pra nunca existir campanha sem os candidatos que ele já pediu.
+		if len(req.TalentIDs) > 0 {
+			if _, err := repo.CreateCandidatesFromTalents(ctx, companyID, c.ID, req.TalentIDs); err != nil {
+				return err
+			}
 		}
 		return activity.NewRepository(db).Create(ctx, &activity.Entry{
 			CompanyID: companyID, CampaignID: &c.ID,
@@ -142,11 +170,20 @@ func (s *service) Create(ctx context.Context, companyID, createdByUserID string,
 		return nil, apperror.Internal("falha ao criar campanha")
 	}
 
-	// Campanha recém-criada não pode ter candidato nenhum ainda — monta a resposta direto das
-	// fases que acabamos de inserir (contagem 0) em vez de fazer outra ida ao banco.
-	counts := make([]PhaseCount, len(phases))
-	for i, p := range phases {
-		counts[i] = PhaseCount{CampaignID: c.ID, Key: p.Key, Position: p.Position, Count: 0}
+	// Sem talentos puxados: campanha recém-criada não tem candidato nenhum, então monta a resposta
+	// direto das fases que acabamos de inserir (contagem 0) sem outra ida ao banco. Com talentos
+	// puxados, a contagem 0 seria mentira — reconsulta de verdade (só neste caso, que é o incomum).
+	var counts []PhaseCount
+	if len(req.TalentIDs) == 0 {
+		counts = make([]PhaseCount, len(phases))
+		for i, p := range phases {
+			counts[i] = PhaseCount{CampaignID: c.ID, Key: p.Key, Position: p.Position, Count: 0}
+		}
+	} else {
+		counts, err = s.repo.PhaseCountsByCampaign(ctx, companyID, c.ID)
+		if err != nil {
+			return nil, apperror.Internal("falha ao buscar campanha recém-criada")
+		}
 	}
 	view := assembleView(*c, counts)
 	return &view, nil
@@ -344,6 +381,72 @@ func (s *service) GetPublicInfo(ctx context.Context, id string) (*PublicInfo, er
 		return nil, apperror.NotFound("vaga não encontrada")
 	}
 	return info, nil
+}
+
+func (s *service) AddTalentsToCampaign(ctx context.Context, companyID, campaignID string, talentIDs []string) (*AddTalentsResult, error) {
+	c, err := s.repo.FindByID(ctx, companyID, campaignID)
+	if err != nil {
+		return nil, apperror.Internal("falha ao buscar campanha")
+	}
+	if c == nil {
+		return nil, apperror.NotFound("campanha não encontrada")
+	}
+
+	added, err := s.repo.CreateCandidatesFromTalents(ctx, companyID, campaignID, talentIDs)
+	if err != nil {
+		return nil, apperror.Internal("falha ao adicionar talentos ao funil")
+	}
+	addedSet := make(map[string]bool, len(added))
+	for _, id := range added {
+		addedSet[id] = true
+	}
+
+	result := &AddTalentsResult{Added: added, Skipped: []SkippedTalent{}}
+	var toExplain []string
+	for _, id := range talentIDs {
+		if !addedSet[id] {
+			toExplain = append(toExplain, id)
+		}
+	}
+	if len(toExplain) == 0 {
+		return result, nil
+	}
+
+	eligibility, err := s.repo.FindTalentsEligibility(ctx, companyID, toExplain)
+	if err != nil {
+		return nil, apperror.Internal("falha ao verificar elegibilidade dos talentos")
+	}
+	found := make(map[string]TalentEligibility, len(eligibility))
+	for _, e := range eligibility {
+		found[e.ID] = e
+	}
+	seen := make(map[string]bool, len(toExplain))
+	for _, id := range toExplain {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		if e, ok := found[id]; ok {
+			result.Skipped = append(result.Skipped, SkippedTalent{TalentID: id, Name: e.Name, Reason: skipReason(e.ConsentState)})
+		} else {
+			result.Skipped = append(result.Skipped, SkippedTalent{TalentID: id, Reason: "não encontrado no banco desta empresa"})
+		}
+	}
+	return result, nil
+}
+
+// skipReason traduz o consent_state real de um talento que não virou candidato — nunca um "não deu
+// certo" genérico: quem viu a tela escolheu aquele id de propósito e merece saber exatamente por
+// quê, principalmente quando o motivo é LGPD (ver eligibleConsentStatesSQL em repository.go).
+func skipReason(consentState string) string {
+	switch consentState {
+	case "oposicao_exclusao":
+		return "esta pessoa pediu exclusão dos dados — nunca pode virar candidata"
+	case "nao_notificado":
+		return "ainda não foi notificado(a) sobre o tratamento dos dados — marque \"primeiro contato\" antes de adicionar"
+	default:
+		return "já é candidato(a) desta campanha ou não pôde ser adicionado(a)"
+	}
 }
 
 func (s *service) FunnelSummary(ctx context.Context, companyID string, period ReportPeriod) ([]PhaseCount, error) {
