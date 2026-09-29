@@ -3,6 +3,7 @@ package campaign
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -14,6 +15,18 @@ type Repository interface {
 	FindByID(ctx context.Context, companyID, id string) (*Campaign, error)
 	ListByCompany(ctx context.Context, companyID string) ([]Campaign, error)
 	Create(ctx context.Context, c *Campaign, phases []Phase) error
+	// CreateCandidatesFromTalents cria um candidato inicial (fase Recebidos) para cada talento do
+	// banco escolhido — no match reverso do assistente de criação (dentro da MESMA transação que
+	// Create) ou depois, numa campanha já existente (ver AddTalentsToCampaign). Devolve os
+	// talentIDs que efetivamente viraram candidato: um id que não existe, não é desta empresa,
+	// que já é candidato desta campanha (colisão de e-mail), ou cujo consent_state não autoriza
+	// uso ativo em processo seletivo (ver ELIGIBLE_CONSENT_STATES logo abaixo) fica de fora da
+	// lista devolvida, sem abortar os demais — a seleção veio de uma tela que pode estar um passo
+	// desatualizada, e a resposta certa a UM id problemático nunca é derrubar o lote inteiro.
+	CreateCandidatesFromTalents(ctx context.Context, companyID, campaignID string, talentIDs []string) ([]string, error)
+	// FindTalentsEligibility devolve nome + consent_state dos ids pedidos — usado só pra explicar
+	// ao recrutador por que um talento não entrou (ver TalentEligibility).
+	FindTalentsEligibility(ctx context.Context, companyID string, talentIDs []string) ([]TalentEligibility, error)
 	SetStatus(ctx context.Context, companyID, id string, status Status, pausedAt *time.Time) error
 	// SetPublicApplicationsEnabled liga/desliga o link de candidatura pública — estado desejado
 	// explícito (não um toggle cego), porque "gerar link" e "desativar link" são duas ações
@@ -38,7 +51,9 @@ type Repository interface {
 	// candidatos cuja fase atual está nesta posição do funil ou adiante, nunca uma contagem
 	// exata "quem está sentado aqui agora". Ver PhaseCount no model.go pro porquê.
 	PhaseCountsByCampaign(ctx context.Context, companyID, campaignID string) ([]PhaseCount, error)
-	PhaseCountsByCompany(ctx context.Context, companyID string) ([]PhaseCount, error)
+	// PhaseCountsByCompany recorta por período de CANDIDATURA (ver ReportPeriod); o zero value
+	// não recorta nada, que é o que a tela de Campanhas usa.
+	PhaseCountsByCompany(ctx context.Context, companyID string, period ReportPeriod) ([]PhaseCount, error)
 	// HiredCount só é relevante pra campanhas encerradas (usado no texto de `meta`) — ninguém
 	// ainda produz esse estado nesta versão, então é sempre chamado sob demanda, não em massa.
 	HiredCount(ctx context.Context, companyID, campaignID string) (int, error)
@@ -127,6 +142,104 @@ func (r *postgresRepository) Create(ctx context.Context, c *Campaign, phases []P
 		}
 	}
 	return nil
+}
+
+// eligibleConsentStatesSQL é o filtro de LGPD de quem pode virar candidato ATIVO de uma campanha
+// (diferente do filtro mais frouxo de leitura/match, que só bloqueia oposicao_exclusao — ver
+// ReverseMatch em talent/reversematch.go). Puxar alguém pro funil não é só "ler o perfil": é o
+// primeiro passo de um processo seletivo de verdade, que pode terminar em contato, avaliação e
+// decisão registrados em nome da pessoa.
+//
+//   - 'consentido': a pessoa já autorizou explicitamente o reaproveitamento em vaga futura
+//     (documento de especificação do Banco de Talentos, seção 5.1) — caso direto.
+//   - 'notificado': foi informada do tratamento e não se opôs (seção 5.2) — base legal de
+//     legítimo interesse já comunicado, suficiente pra este uso.
+//   - 'nao_notificado' FICA DE FORA de propósito: a pessoa ainda nem sabe que está no banco
+//     (comum em cadastro manual — "achei no LinkedIn"). Torná-la candidata ativa de uma vaga sem
+//     que o aviso de tratamento tenha disparado pula exatamente a etapa que o documento describe
+//     como o gatilho certo (seção 5.2: "quando o recrutador faz o primeiro contato real... o
+//     sistema dispara o aviso de tratamento"). O caminho correto é MarkFirstContact primeiro
+//     (POST /talents/:id/first-contact, já existe) — só then a pessoa fica elegível aqui.
+//   - 'oposicao_exclusao' nunca entra, sem exceção.
+const eligibleConsentStatesSQL = `t.consent_state in ('consentido', 'notificado')`
+
+func (r *postgresRepository) CreateCandidatesFromTalents(ctx context.Context, companyID, campaignID string, talentIDs []string) ([]string, error) {
+	if len(talentIDs) == 0 {
+		return nil, nil
+	}
+	// Duas CTEs de escrita encadeadas (candidato, depois skills copiadas) mais um SELECT final que
+	// só lê de `created` — "criar o candidato" e "copiar as skills dele" continuam sendo uma
+	// unidade atômica (sem isso, uma falha entre os dois deixaria candidato sem skill nenhuma,
+	// quebrando a mesma maquinária de avaliação que já espera candidate_skills preenchido — ver
+	// candidate/skillmatch.go), e o SELECT é o que devolve pro chamador quem de fato entrou.
+	//
+	// ON CONFLICT no e-mail: mesmo índice parcial de migrations/0010 (uq_candidates_campaign_email).
+	// Sem isto, pedir pra adicionar um talento que por acaso já é candidato desta campanha (e-mail
+	// repetido) derrubaria a transação INTEIRA com violação de unicidade — os outros talentos do
+	// mesmo pedido, que não tinham nada de errado, seriam recusados junto por causa de UM só.
+	rows, err := r.db.Query(ctx, `
+		with created as (
+			insert into candidates (company_id, campaign_id, talent_id, name, email, phone, linkedin_url,
+			                        city, state, years_experience, phase_key, status, summary,
+			                        education_degree, education_institution, education_period)
+			select $2, $3, t.id, t.name, t.email, t.phone, t.linkedin_url, t.city, t.state,
+			       t.years_experience, 'recebidos', 'aguardando_triagem_ia', t.summary,
+			       t.education_degree, t.education_institution, t.education_period
+			from talents t
+			where t.id = any($1) and t.company_id = $2
+			  and `+eligibleConsentStatesSQL+` and t.bank_entered_at is not null
+			on conflict (campaign_id, email) where deleted_at is null and email is not null do nothing
+			returning id, talent_id
+		), skills_copied as (
+			insert into candidate_skills (candidate_id, skill_id, level, years_experience)
+			select created.id, ts.skill_id, ts.level, ts.years_experience
+			from created join talent_skills ts on ts.talent_id = created.talent_id
+			returning 1
+		)
+		select talent_id from created
+	`, talentIDs, companyID, campaignID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var added []string
+	for rows.Next() {
+		var talentID string
+		if err := rows.Scan(&talentID); err != nil {
+			return nil, err
+		}
+		added = append(added, talentID)
+	}
+	return added, rows.Err()
+}
+
+// TalentEligibility é o que AddTalentsToCampaign usa pra explicar, id a id, por que um talento
+// pedido não entrou como candidato — nunca um silêncio sobre uma seleção que o recrutador fez.
+type TalentEligibility struct {
+	ID, Name, ConsentState string
+}
+
+// FindTalentsEligibility lê nome + consent_state dos ids pedidos (só isso, é o suficiente pra
+// montar a mensagem de "por que não" quando CreateCandidatesFromTalents deixa alguém de fora).
+// Ids que não existem nesta empresa simplesmente não aparecem no retorno.
+func (r *postgresRepository) FindTalentsEligibility(ctx context.Context, companyID string, talentIDs []string) ([]TalentEligibility, error) {
+	rows, err := r.db.Query(ctx, `
+		select id, name, consent_state::text from talents
+		where id = any($1) and company_id = $2 and bank_entered_at is not null
+	`, talentIDs, companyID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []TalentEligibility{}
+	for rows.Next() {
+		var e TalentEligibility
+		if err := rows.Scan(&e.ID, &e.Name, &e.ConsentState); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
 }
 
 func (r *postgresRepository) SetStatus(ctx context.Context, companyID, id string, status Status, pausedAt *time.Time) error {
@@ -292,11 +405,26 @@ func (r *postgresRepository) PhaseCountsByCampaign(ctx context.Context, companyI
 	`, companyID, campaignID)
 }
 
-func (r *postgresRepository) PhaseCountsByCompany(ctx context.Context, companyID string) ([]PhaseCount, error) {
-	return r.queryPhaseCounts(ctx, phaseCountsQuery+`
+func (r *postgresRepository) PhaseCountsByCompany(ctx context.Context, companyID string, period ReportPeriod) ([]PhaseCount, error) {
+	args := []any{companyID}
+	// O recorte entra no ON do left join, NÃO num where: no where, uma campanha sem nenhuma
+	// candidatura no período sairia da lista inteira (o left join produz linha com c.* nulo, que
+	// o where descartaria). No ON, ela continua aparecendo com contagem zero — que é a resposta
+	// certa pra "esta campanha não recebeu ninguém neste mês".
+	filter := ""
+	if period.From != nil {
+		args = append(args, *period.From)
+		filter += fmt.Sprintf(" and c.created_at >= $%d", len(args))
+	}
+	if period.To != nil {
+		args = append(args, *period.To)
+		filter += fmt.Sprintf(" and c.created_at < $%d", len(args))
+	}
+
+	return r.queryPhaseCounts(ctx, phaseCountsQuery+filter+`
 		group by target.campaign_id, target.phase_key, target.position
 		order by target.campaign_id, target.position
-	`, companyID)
+	`, args...)
 }
 
 func (r *postgresRepository) HiredCount(ctx context.Context, companyID, campaignID string) (int, error) {

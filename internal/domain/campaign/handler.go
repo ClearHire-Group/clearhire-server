@@ -2,6 +2,7 @@ package campaign
 
 import (
 	"errors"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 
@@ -29,12 +30,18 @@ func (h *Handler) RegisterRoutes(router fiber.Router) {
 	group.Patch("/:id/phases", h.UpdatePhases)
 	group.Post("/:id/toggle-pause", h.TogglePause)
 	group.Post("/:id/public-application-link", h.SetPublicLink)
+	group.Post("/:id/talents", h.AddTalents)
 }
 
 // RegisterPublicRoutes pluga a única leitura sem tenant deste domínio — GET /public/campaigns/:id,
 // chamada pelo candidato anônimo antes de se candidatar. Mesmo padrão de company.Handler.RegisterPublicRoutes.
+// Era a única rota anônima sem limite nenhum: cada chamada vai ao Postgres, e o id é UUID (não dá
+// para enumerar campanha por força bruta), então o risco não é vazamento e sim inundação.
 func (h *Handler) RegisterPublicRoutes(router fiber.Router) {
-	router.Group("/public/campaigns").Get("/:id", h.GetPublicInfo)
+	router.Group("/public/campaigns",
+		middleware.GlobalRateLimit(600, time.Minute),
+		middleware.RateLimit(60, time.Minute),
+	).Get("/:id", h.GetPublicInfo)
 }
 
 // RegisterReportsRoutes pluga os agregados que a tela Relatórios consome — moram aqui porque
@@ -131,7 +138,7 @@ func (h *Handler) TogglePause(c *fiber.Ctx) error {
 	if !ok {
 		return nil
 	}
-	view, err := h.service.TogglePause(c.Context(), middleware.CompanyID(c), id)
+	view, err := h.service.TogglePause(c.Context(), middleware.CompanyID(c), id, middleware.UserID(c))
 	if err != nil {
 		return h.respondError(c, err)
 	}
@@ -155,6 +162,29 @@ func (h *Handler) SetPublicLink(c *fiber.Ctx) error {
 	return response.OK(c, toResponse(view))
 }
 
+// AddTalents pluga o match reverso pós-criação: puxar pro funil um talento que o recrutador já
+// revisou (e, opcionalmente, mandou avaliar pela IA — ver talent.Handler.AssessTalentRecommendations)
+// numa campanha que já existe de verdade.
+func (h *Handler) AddTalents(c *fiber.Ctx) error {
+	id, ok := idparam.Valid(c, "id")
+	if !ok {
+		return nil
+	}
+	var req AddTalentsRequest
+	if err := c.BodyParser(&req); err != nil {
+		return response.Err(c, fiber.StatusBadRequest, "payload inválido")
+	}
+	if err := validator.Validate(req); err != nil {
+		return response.Err(c, fiber.StatusBadRequest, "dados obrigatórios faltando ou inválidos")
+	}
+
+	result, err := h.service.AddTalentsToCampaign(c.Context(), middleware.CompanyID(c), id, req.TalentIDs)
+	if err != nil {
+		return h.respondError(c, err)
+	}
+	return response.OK(c, toAddTalentsResponse(result))
+}
+
 func (h *Handler) GetPublicInfo(c *fiber.Ctx) error {
 	id, ok := idparam.Valid(c, "id")
 	if !ok {
@@ -167,8 +197,37 @@ func (h *Handler) GetPublicInfo(c *fiber.Ctx) error {
 	return response.OK(c, toPublicInfoResponse(info))
 }
 
+// parseReportPeriod lê `from`/`to` da query string em RFC3339 (ex.: 2026-09-01T00:00:00-03:00).
+// São instantes COM fuso, não datas soltas: quem sabe em que fuso o usuário está é o navegador,
+// então o recorte chega pronto e nenhuma query precisa chutar um timezone. Ausentes = sem limite.
+func parseReportPeriod(c *fiber.Ctx) (ReportPeriod, error) {
+	var period ReportPeriod
+	for _, field := range []struct {
+		name   string
+		target **time.Time
+	}{{"from", &period.From}, {"to", &period.To}} {
+		raw := c.Query(field.name)
+		if raw == "" {
+			continue
+		}
+		parsed, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return period, apperror.BadRequest("parâmetro '" + field.name + "' inválido: use data no formato RFC3339")
+		}
+		*field.target = &parsed
+	}
+	if period.From != nil && period.To != nil && !period.To.After(*period.From) {
+		return period, apperror.BadRequest("o fim do período precisa ser posterior ao início")
+	}
+	return period, nil
+}
+
 func (h *Handler) FunnelSummary(c *fiber.Ctx) error {
-	summary, err := h.service.FunnelSummary(c.Context(), middleware.CompanyID(c))
+	period, err := parseReportPeriod(c)
+	if err != nil {
+		return h.respondError(c, err)
+	}
+	summary, err := h.service.FunnelSummary(c.Context(), middleware.CompanyID(c), period)
 	if err != nil {
 		return h.respondError(c, err)
 	}
@@ -180,7 +239,11 @@ func (h *Handler) FunnelSummary(c *fiber.Ctx) error {
 }
 
 func (h *Handler) CampaignPerformance(c *fiber.Ctx) error {
-	rows, err := h.service.CampaignPerformance(c.Context(), middleware.CompanyID(c))
+	period, err := parseReportPeriod(c)
+	if err != nil {
+		return h.respondError(c, err)
+	}
+	rows, err := h.service.CampaignPerformance(c.Context(), middleware.CompanyID(c), period)
 	if err != nil {
 		return h.respondError(c, err)
 	}

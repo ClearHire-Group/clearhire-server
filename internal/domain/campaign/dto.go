@@ -24,6 +24,12 @@ type CreateCampaignRequest struct {
 	ContractType     string   `json:"contractType" validate:"required,oneof=clt pj estagio"`
 	Seniority        string   `json:"seniority" validate:"required,oneof=junior pleno senior"`
 	PhaseKeys        []string `json:"phaseKeys" validate:"omitempty,max=3,unique,dive,oneof=fit tecnica entrevista"`
+	// TalentIDs são os talentos do banco que o recrutador selecionou na tela de match reverso (ver
+	// talent.Service.ReverseMatch) pra já entrarem candidatos desta campanha, fase Recebidos —
+	// "a IA sugere; o humano decide e executa" (documento de especificação, seção 8.2). Teto de 20
+	// não é limite técnico, é sanidade: mais que isso não é mais "revisar e puxar", é reimportar a
+	// base inteira, que é outra feature (seção 4.3 do mesmo documento).
+	TalentIDs []string `json:"talentIds" validate:"omitempty,max=20,unique,dive,uuid"`
 }
 
 // PhaseResponse espelha Phase do frontend (clearhire-app/src/app/core/models.ts) — key/num/label/count.
@@ -115,6 +121,39 @@ type UpdatePhasesRequest struct {
 // desejado explícito ({enabled: true|false}), não um toggle cego.
 type SetPublicLinkRequest struct {
 	Enabled bool `json:"enabled"`
+}
+
+// AddTalentsRequest é o payload de POST /campaigns/:id/talents — mesmo teto de 20 do TalentIDs em
+// CreateCampaignRequest, mesma justificativa (mais que isso não é "revisar e puxar", é reimportar
+// a base inteira).
+type AddTalentsRequest struct {
+	TalentIDs []string `json:"talentIds" validate:"required,min=1,max=20,unique,dive,uuid"`
+}
+
+// AddTalentsResponse nunca omite um id pedido: todo talentId do request aparece em Added ou em
+// Skipped (com o motivo) — silêncio sobre uma seleção que o recrutador fez de propósito não é
+// aceitável, mesmo quando o motivo é "não pôde".
+type AddTalentsResponse struct {
+	Added   []string                `json:"added"`
+	Skipped []SkippedTalentResponse `json:"skipped"`
+}
+
+type SkippedTalentResponse struct {
+	TalentID string `json:"talentId"`
+	Name     string `json:"name"`
+	Reason   string `json:"reason"`
+}
+
+func toAddTalentsResponse(r *AddTalentsResult) *AddTalentsResponse {
+	added := r.Added
+	if added == nil {
+		added = []string{}
+	}
+	skipped := make([]SkippedTalentResponse, len(r.Skipped))
+	for i, s := range r.Skipped {
+		skipped[i] = SkippedTalentResponse{TalentID: s.TalentID, Name: s.Name, Reason: s.Reason}
+	}
+	return &AddTalentsResponse{Added: added, Skipped: skipped}
 }
 
 // PublicInfoResponse é o que GET /public/campaigns/:id devolve pro candidato anônimo — só o

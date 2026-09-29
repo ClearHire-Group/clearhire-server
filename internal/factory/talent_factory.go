@@ -1,13 +1,25 @@
 package factory
 
 import (
+	"context"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/ClearHire-Group/clearhire-server/internal/domain/candidate"
 	"github.com/ClearHire-Group/clearhire-server/internal/domain/talent"
 )
 
-func InitTalentFactory(db *pgxpool.Pool) *talent.Handler {
-	repo := talent.NewRepository(db)
-	service := talent.NewService(repo)
-	return talent.NewHandler(service)
+// InitTalentFactory recebe o service de candidate porque o cadastro manual de talento é uma escrita de
+// perfil (extração, skills, experiência), e toda escrita de perfil mora lá. O domínio talent só vê uma
+// função — nenhum import entre os dois.
+func InitTalentFactory(db *pgxpool.Pool, candidates candidate.Service) *talent.Handler {
+	registerManual := func(ctx context.Context, companyID string, in talent.ManualInput) (string, error) {
+		return candidates.RegisterManualTalent(ctx, companyID, candidate.ManualTalentInput{
+			Name: in.Name, RawProfileText: in.RawProfileText, ContextNote: in.ContextNote,
+		})
+	}
+	// candidates.AssessTalentForCampaign já tem a assinatura exata de talent.AssessFunc (os dois
+	// falam llm.CandidateContext/llm.Assessment, pacote neutro) — atribuição direta, sem
+	// conversão nenhuma, diferente de registerManual acima.
+	return talent.NewHandler(talent.NewService(talent.NewRepository(db), registerManual, candidates.AssessTalentForCampaign))
 }

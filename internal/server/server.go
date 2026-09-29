@@ -4,7 +4,11 @@
 package server
 
 import (
+	"strings"
+	"time"
+
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/compress"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/helmet"
 	"github.com/gofiber/fiber/v2/middleware/logger"
@@ -23,9 +27,38 @@ func New(cfg *config.Config) *fiber.App {
 		// próprio de 5MB, ver candidate/handler.go) sem deixar passar coisa absurdamente grande —
 		// bem abaixo do limite de 32MB da API da Claude.
 		BodyLimit: 6 * 1024 * 1024,
+		// Sem timeouts o Fiber espera para sempre: uma conexão que manda 1 byte por vez (slowloris)
+		// ocuparia um worker indefinidamente. O ReadTimeout cobre o upload de currículo (até 5MB);
+		// o WriteTimeout tem que ficar ACIMA do teto total de uma chamada de IA (llm.Limits, 40s) —
+		// senão o servidor cortaria a resposta de uma candidatura que a IA ainda está processando.
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 60 * time.Second,
+		IdleTimeout:  120 * time.Second,
+		// c.IP() alimenta o rate limit por IP. Atrás de um proxy, sem isto todos os clientes
+		// aparecem com o IP do proxy (um balde só para o mundo); confiando em qualquer header, o
+		// cliente escolhe o próprio IP. Então: só se lê o header de IP quando a conexão vem de um
+		// proxy da lista, e o valor precisa ser um IP válido (senão o Fiber devolve o string bruto,
+		// e cada valor inventado viraria um balde novo).
+		ProxyHeader:             cfg.ClientIPHeader,
+		EnableTrustedProxyCheck: true,
+		TrustedProxies:          cfg.TrustedProxies,
+		EnableIPValidation:      true,
 	})
 
 	app.Use(recover.New())
+	// Compressão das respostas: JSON de listagem é muito repetitivo e cai para ~5-10% do tamanho (a
+	// listagem de 3 mil talentos passava de 8 MB crus). LevelBestSpeed porque o gargalo é a rede, não a
+	// taxa de compressão.
+	//
+	// /auth fica de fora de propósito (BREACH): comprimir uma resposta que carrega um segredo (o token
+	// de acesso no corpo do login) junto com dado controlado por quem pede deixa o tamanho comprimido
+	// vazar o segredo. Nenhuma outra rota devolve segredo no corpo.
+	app.Use(compress.New(compress.Config{
+		Level: compress.LevelBestSpeed,
+		Next: func(c *fiber.Ctx) bool {
+			return strings.HasPrefix(c.Path(), "/api/v1/auth")
+		},
+	}))
 	app.Use(logger.New())
 	// Headers de resposta padrão (X-Content-Type-Options, X-Frame-Options, HSTS quando servido
 	// por HTTPS, etc.) — API pura em JSON não tem muita superfície de HTML/frame pra proteger,

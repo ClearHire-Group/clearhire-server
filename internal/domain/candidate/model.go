@@ -69,8 +69,8 @@ type ExperienceEntry struct {
 }
 
 // AIAssessment é a avaliação da IA pra fase ATUAL do candidato (candidate_ai_assessments é
-// histórico — sempre a mais recente por created_at). nil em CandidateDetail quando o candidato
-// ainda não foi avaliado nenhuma vez.
+// histórico — sempre a mais recente DA FASE ATUAL por created_at; ver AssessmentHistory pra
+// fases anteriores). nil em CandidateDetail quando o candidato ainda não foi avaliado nesta fase.
 type AIAssessment struct {
 	MatchPct      int
 	MatchLabel    string
@@ -78,6 +78,41 @@ type AIAssessment struct {
 	Justification string
 	Strengths     []string
 	Concerns      []string
+	// Confidence é o único discriminador de estado (ver migrations/0013): 'alta'|'media'|'baixa'
+	// são graus de uma conclusão real; 'insuficiente' significa que a IA optou por não concluir
+	// nesta fase — MatchPct/Strengths/Concerns continuam preenchidos (o schema estrito do
+	// provedor exige), mas quem lê deve tratá-los como não confiáveis quando Confidence é
+	// 'insuficiente', olhando StageInsight/MissingInformation em vez disso. Vazio em avaliações
+	// gravadas antes da migration 0013 (prompt v1/v2, sem este campo) — tratado como 'alta'
+	// implícito por quem lê, nunca como 'insuficiente' (não existe base pra inferir isso agora).
+	Confidence string
+	// StageInsight é o insight CURTO e específico do foco desta fase (ver assessment.go,
+	// stageFocus) — distinto de Justification, que é a justificativa geral de sempre. Vazio nas
+	// fases sem foco definido (recebidos, selecionados).
+	StageInsight string
+	// MissingInformation é o que faltou pra concluir com mais confiança nesta fase — preenchido
+	// nos dois estados de Confidence, não só em 'insuficiente'.
+	MissingInformation []string
+	// ComparisonFlag compara com a fase anterior AVALIADA deste candidato (não com a campanha
+	// inteira): 'reforca_anterior'|'diverge_anterior'|'novo', ou vazio quando não há fase
+	// anterior avaliada pra comparar.
+	ComparisonFlag string
+}
+
+// AIAssessmentHistoryEntry é uma avaliação passada do candidato, com a fase a que ela pertence —
+// o que AssessmentHistory devolve pra reconstruir a trilha completa (ver comentário em
+// migrations/0001_init.sql, candidate_ai_assessments: "é o que dá a trilha de 'o que a IA dizia
+// quando aprovamos essa pessoa'", nunca lida de volta até esta migration).
+type AIAssessmentHistoryEntry struct {
+	PhaseKey   string
+	Assessment AIAssessment
+	CreatedAt  time.Time
+}
+
+// AssessmentOrigin é quem produziu uma avaliação: o que torna cada recomendação auditável depois
+// (ver migrations/0010).
+type AssessmentOrigin struct {
+	Provider, Model, PromptVersion string
 }
 
 // CandidateDetail é tudo que a tela de perfil (GET /candidates/:id) precisa — Candidate mais
@@ -94,6 +129,9 @@ type CandidateDetail struct {
 	Experience           []ExperienceEntry
 	Skills               []string
 	AI                   *AIAssessment
+	// AIHistory é toda avaliação já gravada deste candidato, incluindo a da fase atual (dto.go
+	// filtra a fase atual antes de expor — ver toCandidateProfileResponse), mais antiga primeiro.
+	AIHistory []AIAssessmentHistoryEntry
 }
 
 // Decision é uma linha de candidate_decisions — o evento de domínio "RH decidiu": nunca só o
@@ -137,6 +175,7 @@ type TalentSeed struct {
 	Origin                                                 string
 	LegalBasis                                             string
 	ConsentState                                           string
+	RecruiterNotes                                         string
 }
 
 // CandidateSeed é o que se grava em candidates numa candidatura pública — phase_key/status ficam

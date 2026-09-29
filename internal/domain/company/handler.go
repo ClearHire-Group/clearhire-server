@@ -22,8 +22,16 @@ func NewHandler(service Service) *Handler {
 
 // RegisterPublicRoutes pluga o cadastro de empresa — a única rota deste
 // domínio que roda ANTES de existir sessão (é ela que cria a primeira).
+// O teto por IP contém uma origem insistente; o global contém a enumeração DISTRIBUÍDA, que é o
+// abuso que importa aqui: a resposta "já existe uma conta com este e-mail" é um oráculo de
+// existência de conta, e sem o balde global N origens passam N vezes pelo limite por IP sem
+// encostar nele. Cadastro de empresa é evento raro, então 30/min para a plataforma inteira está
+// muito acima do uso legítimo.
 func (h *Handler) RegisterPublicRoutes(router fiber.Router) {
-	router.Group("/companies", middleware.RateLimit(5, time.Minute)).Post("/", h.Register)
+	router.Group("/companies",
+		middleware.GlobalRateLimit(30, time.Minute),
+		middleware.RateLimit(5, time.Minute),
+	).Post("/", h.Register)
 }
 
 // RegisterProfileRoutes pluga o perfil cultural da empresa — sempre a empresa do

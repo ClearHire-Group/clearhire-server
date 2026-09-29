@@ -11,6 +11,10 @@ import (
 
 type Repository interface {
 	FindByID(ctx context.Context, id string) (*User, error)
+	// IsActive é a checagem por requisição do middleware de autenticação (ver middleware.Auth):
+	// uma coluna, por chave primária, em vez de carregar o usuário inteiro. Usuário inexistente
+	// devolve false, não erro — conta apagada é conta inativa para quem pergunta.
+	IsActive(ctx context.Context, id string) (bool, error)
 	FindByEmail(ctx context.Context, email string) (*User, error)
 	CountActiveByCompany(ctx context.Context, companyID string) (int, error)
 	Create(ctx context.Context, u *User) error
@@ -83,6 +87,15 @@ func (r *postgresRepository) CountActiveByCompany(ctx context.Context, companyID
 	var count int
 	err := r.db.QueryRow(ctx, "select count(*) from users where company_id = $1 and is_active", companyID).Scan(&count)
 	return count, err
+}
+
+func (r *postgresRepository) IsActive(ctx context.Context, id string) (bool, error) {
+	var active bool
+	err := r.db.QueryRow(ctx, "select is_active from users where id = $1", id).Scan(&active)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return active, err
 }
 
 func (r *postgresRepository) Create(ctx context.Context, u *User) error {

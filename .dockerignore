@@ -1,0 +1,10 @@
+.git
+.devdb
+bin
+tmp
+*.log
+.env
+.env.example
+CLAUDE.md
+docs
+README.md

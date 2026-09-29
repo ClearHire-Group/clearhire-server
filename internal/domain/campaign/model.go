@@ -87,3 +87,18 @@ type PhaseCount struct {
 	Position   int
 	Count      int
 }
+
+// ReportPeriod recorta a tela Relatórios por DATA DA CANDIDATURA (candidates.created_at), nunca
+// por "como o funil estava naquele dia": o sistema não guarda histórico de fase, então o relatório
+// de um mês passado responde "dos que se candidataram naquele mês, onde eles estão HOJE" — a
+// pergunta que os dados existentes conseguem responder de verdade. Reconstruir o funil retroativo
+// exigiria snapshot histórico, que não existe (mesma limitação já documentada no dashboard).
+//
+// Instantes, não datas: quem escolhe as bordas é o front, que conhece o fuso do usuário. Assim
+// nenhuma query aqui precisa assumir um timezone. From é inclusivo, To é EXCLUSIVO (um mês vai do
+// dia 1º 00:00 ao dia 1º do mês seguinte 00:00). Nil em qualquer um dos dois = sem aquele limite;
+// o zero value, portanto, é "todo o período".
+type ReportPeriod struct {
+	From *time.Time
+	To   *time.Time
+}

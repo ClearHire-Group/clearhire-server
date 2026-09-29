@@ -3,6 +3,7 @@ package candidate
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 // initials devolve as duas letras que a bolinha de avatar mostra ("Marina Albuquerque" -> "MA").
@@ -54,6 +55,15 @@ var phaseLabels = map[string]string{
 	PhaseTecnica:      "Triagem Técnica",
 	PhaseEntrevista:   "Entrevista Estruturada",
 	PhaseSelecionados: "Selecionados",
+}
+
+// phaseLabel cai de volta na própria chave quando a fase não está no mapa — o rótulo só alimenta
+// texto de UI, então uma chave crua é degradação aceitável, melhor que string vazia.
+func phaseLabel(key string) string {
+	if label, ok := phaseLabels[key]; ok {
+		return label
+	}
+	return key
 }
 
 // statusLabel traduz (status, fase) pro rótulo em português que a tela já sabe estilizar (ver
@@ -108,14 +118,18 @@ func locationLabel(city, state string) string {
 // de campanha lista. avatarColorIndex é derivado do id (determinístico: mesmo candidato sempre cai
 // na mesma cor, sem precisar persistir isso em lugar nenhum).
 type CandidateResponse struct {
-	ID                 string  `json:"id"`
-	CampaignID         string  `json:"campaignId"`
-	Phase              string  `json:"phase"`
-	Name               string  `json:"name"`
-	Email              string  `json:"email"`
-	Experience         string  `json:"experience"`
-	Location           string  `json:"location"`
-	MatchPct           *int    `json:"matchPct"`
+	ID         string `json:"id"`
+	CampaignID string `json:"campaignId"`
+	Phase      string `json:"phase"`
+	Name       string `json:"name"`
+	Email      string `json:"email"`
+	Experience string `json:"experience"`
+	Location   string `json:"location"`
+	MatchPct   *int   `json:"matchPct"`
+	// YearsExperience e AppliedAt existem para ORDENAR a listagem (os rótulos de texto acima não
+	// ordenam: "10 anos" viria antes de "2 anos").
+	YearsExperience    *int    `json:"yearsExperience"`
+	AppliedAt          string  `json:"appliedAt"`
 	Status             string  `json:"status"`
 	Initials           string  `json:"initials"`
 	AvatarColorIndex   int     `json:"avatarColorIndex"`
@@ -133,6 +147,8 @@ func toCandidateResponse(c *Candidate) *CandidateResponse {
 		Experience:         experienceLabel(c.YearsExperience),
 		Location:           locationLabel(c.City, c.State),
 		MatchPct:           c.MatchPct,
+		YearsExperience:    c.YearsExperience,
+		AppliedAt:          c.CreatedAt.UTC().Format(time.RFC3339),
 		Status:             statusLabel(c.Status, c.PhaseKey),
 		Initials:           initials(c.Name),
 		AvatarColorIndex:   avatarColorIndex(c.ID),
@@ -156,7 +172,12 @@ type CandidateProfileResponse struct {
 	Experience      []experienceEntryResponse `json:"experience"`
 	Education       candidateEducation        `json:"education"`
 	Skills          []string                  `json:"skills"`
-	AI              candidateAIResponse       `json:"ai"`
+	// AI é null enquanto o candidato não foi avaliado NESTA FASE. Antes era um objeto zerado, o que
+	// a tela mostrava como "0%" — indistinguível de uma avaliação real com nota baixa.
+	AI *candidateAIResponse `json:"ai"`
+	// AIHistory é a avaliação de cada fase ANTERIOR já avaliada (a atual não repete — está em AI),
+	// mais antiga primeiro, na ordem do funil desta campanha — nunca vazia vira `null` no JSON.
+	AIHistory []candidateAIHistoryEntry `json:"aiHistory"`
 }
 
 type candidateContact struct {
@@ -185,6 +206,78 @@ type candidateAIResponse struct {
 	Strengths     []string `json:"strengths"`
 	Concerns      []string `json:"concerns"`
 	Justification string   `json:"justification"`
+	// Confidence é sempre um de 'alta'|'media'|'baixa'|'insuficiente' na resposta, nunca vazio —
+	// avaliações gravadas antes da migration 0013 (sem este campo no banco) saem como 'alta': era
+	// isso que elas eram, uma nota e pronto, sem o discriminador novo (ver resolveConfidence).
+	Confidence         string   `json:"confidence"`
+	StageInsight       string   `json:"stageInsight"`
+	MissingInformation []string `json:"missingInformation"`
+	ComparisonFlag     string   `json:"comparisonFlag"`
+}
+
+// resolveConfidence decide o que expor pro front quando o banco não tem confidence gravado —
+// única em ser uma decisão de PRESENTATION (o domínio, AIAssessment.Confidence, fica fiel ao banco:
+// "" quando não gravado). Ver comentário de candidateAIResponse.Confidence.
+func resolveConfidence(raw string) string {
+	if raw == "" {
+		return "alta"
+	}
+	return raw
+}
+
+func toAIResponse(a *AIAssessment) *candidateAIResponse {
+	if a == nil {
+		return nil
+	}
+	return &candidateAIResponse{
+		MatchPct:           a.MatchPct,
+		MatchLabel:         a.MatchLabel,
+		MatchNote:          a.MatchNote,
+		Strengths:          a.Strengths,
+		Concerns:           a.Concerns,
+		Justification:      a.Justification,
+		Confidence:         resolveConfidence(a.Confidence),
+		StageInsight:       a.StageInsight,
+		MissingInformation: a.MissingInformation,
+		ComparisonFlag:     a.ComparisonFlag,
+	}
+}
+
+// candidateAIHistoryEntry é uma linha do histórico de avaliações do candidato — a mesma forma de
+// candidateAIResponse, com a fase a que pertence.
+type candidateAIHistoryEntry struct {
+	Phase      string `json:"phase"`
+	PhaseLabel string `json:"phaseLabel"`
+	*candidateAIResponse
+	CreatedAt string `json:"createdAt"`
+}
+
+// toAIHistoryResponse filtra a fase ATUAL fora (ela já vai em CandidateProfileResponse.AI,
+// destacada) — "histórico" aqui é sempre "fases anteriores", nunca duplica a que já está em
+// destaque na tela.
+func toAIHistoryResponse(entries []AIAssessmentHistoryEntry, currentPhaseKey string) []candidateAIHistoryEntry {
+	out := make([]candidateAIHistoryEntry, 0, len(entries))
+	for _, e := range entries {
+		if e.PhaseKey == currentPhaseKey {
+			continue
+		}
+		out = append(out, candidateAIHistoryEntry{
+			Phase:               e.PhaseKey,
+			PhaseLabel:          phaseLabel(e.PhaseKey),
+			candidateAIResponse: toAIResponse(&e.Assessment),
+			CreatedAt:           e.CreatedAt.UTC().Format(time.RFC3339),
+		})
+	}
+	return out
+}
+
+// ResumeFileForm são os campos de texto do upload de currículo (multipart). O modo PDF não passa
+// pelo BodyParser/JSON, então sem esta struct nome e e-mail entrariam sem nenhuma validação. As
+// regras são as mesmas do JSON — ver normalizeAndValidate em application_validation.go.
+type ResumeFileForm struct {
+	Name    string
+	Email   string
+	Consent bool
 }
 
 // DecideResponse é o que POST /candidates/:id/decisions devolve — só o que o frontend
@@ -216,17 +309,8 @@ func toCandidateProfileResponse(d *CandidateDetail) *CandidateProfileResponse {
 		experience[i] = experienceEntryResponse{Role: e.Role, Company: e.Company, Period: e.PeriodLabel, Description: e.Description}
 	}
 
-	ai := candidateAIResponse{Strengths: []string{}, Concerns: []string{}}
-	if d.AI != nil {
-		ai = candidateAIResponse{
-			MatchPct:      d.AI.MatchPct,
-			MatchLabel:    d.AI.MatchLabel,
-			MatchNote:     d.AI.MatchNote,
-			Strengths:     d.AI.Strengths,
-			Concerns:      d.AI.Concerns,
-			Justification: d.AI.Justification,
-		}
-	}
+	ai := toAIResponse(d.AI)
+	aiHistory := toAIHistoryResponse(d.AIHistory, d.PhaseKey)
 
 	return &CandidateProfileResponse{
 		CandidateID:     d.ID,
@@ -242,5 +326,6 @@ func toCandidateProfileResponse(d *CandidateDetail) *CandidateProfileResponse {
 		Education:       candidateEducation{Degree: d.EducationDegree, Institution: d.EducationInstitution, Period: d.EducationPeriod},
 		Skills:          d.Skills,
 		AI:              ai,
+		AIHistory:       aiHistory,
 	}
 }
