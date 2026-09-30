@@ -319,7 +319,7 @@ func validateEducationPeriod(raw string) (string, string) {
 	maxYear := time.Now().Year() + periodYearsAhead
 	years := make([]int, len(matches))
 	for i, m := range matches {
-		fmt.Sscanf(m, "%d", &years[i])
+		_, _ = fmt.Sscanf(m, "%d", &years[i]) // m casou com periodYearPattern: não tem como falhar
 		if years[i] < minPeriodYear || years[i] > maxYear {
 			return period, fmt.Sprintf("Ano fora do intervalo aceito (%d a %d).", minPeriodYear, maxYear)
 		}

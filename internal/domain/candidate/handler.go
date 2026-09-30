@@ -223,7 +223,7 @@ func readResumePDF(c *fiber.Ctx) ([]byte, string) {
 	if err != nil {
 		return nil, "Não foi possível ler o arquivo. Tente enviá-lo de novo."
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }() // só leitura: erro no Close não muda nada
 
 	pdfBytes, err := io.ReadAll(io.LimitReader(file, maxResumeFileBytes+1))
 	if err != nil {

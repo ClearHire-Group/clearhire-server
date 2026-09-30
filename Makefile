@@ -13,4 +13,4 @@ tidy:
 	go mod tidy
 
 migrate:
-	for f in migrations/*.sql; do psql "$$DATABASE_URL" -f "$$f" || exit 1; done
+	bash scripts/migrate.sh

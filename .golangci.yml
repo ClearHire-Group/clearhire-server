@@ -1,0 +1,10 @@
+version: "2"
+
+linters:
+  settings:
+    staticcheck:
+      # Padrão do golangci-lint + S1016 desligado. S1016 sugere converter um tipo no outro
+      # (`Response(item)`) em vez do literal campo a campo. Aqui o literal é de propósito: é o que
+      # mantém model e DTO desacoplados (README: "nunca serializa o model direto como resposta") —
+      # com conversão, um campo novo no model vazaria para o JSON sem ninguém escolher isso.
+      checks: ["all", "-ST1000", "-ST1003", "-ST1016", "-ST1020", "-ST1021", "-ST1022", "-S1016"]
