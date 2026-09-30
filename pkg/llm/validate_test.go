@@ -5,7 +5,6 @@ import (
 	"testing"
 )
 
-func ptrInt(v int) *int           { return &v }
 func ptrFloat(v float64) *float64 { return &v }
 func ptrStr(v string) *string     { return &v }
 

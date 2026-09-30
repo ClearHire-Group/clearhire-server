@@ -5,6 +5,8 @@ on:
     branches: [main, develop]
   pull_request:
     branches: [main, develop]
+    # `edited` para revalidar quando só o título da PR muda (roda a pipeline inteira de novo).
+    types: [opened, synchronize, reopened, edited]
 
 permissions:
   contents: read
@@ -16,32 +18,67 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  test:
-    name: test
+  branch:
+    name: Branch Validation
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-
-      - name: gofmt
+      - name: Validate PR target branch
+        env:
+          # Via env, nunca interpolado direto no script: branch e título são escolhidos por quem abre a PR.
+          HEAD: ${{ github.head_ref }}
+          BASE: ${{ github.base_ref }}
         run: |
-          unformatted=$(gofmt -l .)
-          if [ -n "$unformatted" ]; then
-            echo "Arquivos fora do gofmt (rode 'gofmt -w .'):"
-            echo "$unformatted"
+          echo "Validating PR target branch..."
+          echo "Source branch: $HEAD"
+          echo "Target branch: $BASE"
+
+          pattern='^(feat|fix|hotfix|chore|docs|refactor|test|ci|perf|style|build|release)/[a-z0-9._-]+$'
+
+          if [[ "$BASE" == "main" ]]; then
+            if [[ "$HEAD" != "develop" && ! "$HEAD" =~ ^(hotfix|release)/ ]]; then
+              echo "::error::❌ PRs para 'main' só são aceitos de 'develop', 'hotfix/*' ou 'release/*' (veio de '$HEAD')."
+              exit 1
+            fi
+            echo "✅ PRs para 'main' são aceitos de 'develop', 'hotfix/*' e 'release/*'"
+          else
+            if [[ ! "$HEAD" =~ $pattern ]]; then
+              echo "::error::❌ Branch '$HEAD' fora do padrão <tipo>/<descricao-em-kebab-case>."
+              echo "Tipos aceitos: feat, fix, hotfix, chore, docs, refactor, test, ci, perf, style, build, release."
+              exit 1
+            fi
+            echo "✅ PRs para '$BASE' são aceitos de qualquer branch de feature"
+          fi
+
+          echo "✅ Validação de branch aprovada"
+
+      - name: Check PR title format
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+          BASE: ${{ github.base_ref }}
+        run: |
+          echo "Checking PR title format..."
+
+          # PR de promoção (develop → main) não segue o padrão de título de feature.
+          if [[ "$BASE" == "main" ]]; then
+            echo "✅ PR para 'main': formato de título livre — $TITLE"
+            exit 0
+          fi
+
+          # Conventional Commits: <tipo>(escopo opcional)!: descrição
+          pattern='^(feat|fix|chore|docs|refactor|test|ci|perf|style|build|revert)(\([a-z0-9._-]+\))?!?: .+'
+          if [[ ! "$TITLE" =~ $pattern ]]; then
+            echo "::error::❌ PR title fora do padrão '<tipo>: descrição' (ex.: 'fix: popup atualizar cadastro'). Recebido: $TITLE"
+            echo "Tipos aceitos: feat, fix, chore, docs, refactor, test, ci, perf, style, build, revert."
             exit 1
           fi
 
-      - run: go vet ./...
-      - run: go build ./...
-      - run: go test -race ./...
+          echo "✅ PR title format is valid: $TITLE"
 
-  # Aplica todas as migrations num Postgres vazio, com pgvector, do mesmo jeito que produção aplica.
-  migrations:
-    name: migrations
+  quality:
+    name: Code Quality Checks
     runs-on: ubuntu-latest
+    # Postgres com pgvector para validar as migrations do mesmo jeito que produção as aplica.
     services:
       postgres:
         image: pgvector/pgvector:pg17
@@ -54,43 +91,124 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
-    env:
-      DATABASE_URL: postgres://postgres:postgres@localhost:5432/clearhire?sslmode=disable
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
 
-      - name: Aplica todas as migrations num banco vazio
-        run: bash scripts/migrate.sh
-
-      - name: Segunda execução não reaplica nada
+      - name: Formatação (gofmt)
         run: |
-          out=$(bash scripts/migrate.sh)
-          echo "$out"
-          if grep -q '^aplicando' <<<"$out"; then
-            echo "migrate.sh reaplicou uma migration já registrada"
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::Arquivos fora do gofmt (rode 'gofmt -w .'):"
+            echo "$unformatted"
             exit 1
           fi
 
-  docker:
-    name: docker
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
+      - name: go.mod em dia (go mod tidy)
+        run: go mod tidy -diff
+
+      - name: Lint (golangci-lint)
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.14.0
+
+      - name: Build
+        run: go build ./...
+
+      - name: Testes unitários (com race detector)
+        run: go test -race ./...
+
+      - name: Migrations num banco vazio
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/clearhire?sslmode=disable
+        run: |
+          bash scripts/migrate.sh
+          # Segunda execução não pode reaplicar nada: é o que garante que o CD só roda o que falta.
+          out=$(bash scripts/migrate.sh)
+          echo "$out"
+          if grep -q '^aplicando' <<<"$out"; then
+            echo "::error::migrate.sh reaplicou uma migration já registrada"
+            exit 1
+          fi
+
       - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - name: Build da imagem Docker
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  dependencies:
+    name: Dependency Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Integridade dos módulos (go mod verify)
+        run: go mod verify
+
+      # govulncheck só reprova vulnerabilidade em função que o código de fato chama — vulnerabilidade
+      # em pacote importado mas não usado aparece no relatório sem bloquear.
+      - name: Vulnerabilidades (govulncheck)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          set +e
+          govulncheck ./... > govulncheck.txt 2>&1
+          status=$?
+          set -e
+          cat govulncheck.txt
+          {
+            echo "### govulncheck"
+            echo '```'
+            cat govulncheck.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $status
+
+  # Único check a marcar como obrigatório no ruleset: agrega os outros e falha se qualquer um falhou.
+  summary:
+    name: Validation Summary
+    if: always()
+    needs: [branch, quality, dependencies]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resultado
+        env:
+          BRANCH: ${{ needs.branch.result }}
+          QUALITY: ${{ needs.quality.result }}
+          DEPENDENCIES: ${{ needs.dependencies.result }}
+        run: |
+          icon() { case "$1" in success) echo "✅";; skipped) echo "⏭️";; *) echo "❌";; esac; }
+          {
+            echo "## Validation Summary"
+            echo "| Etapa | Resultado |"
+            echo "|---|---|"
+            echo "| Branch Validation | $(icon "$BRANCH") $BRANCH |"
+            echo "| Code Quality Checks | $(icon "$QUALITY") $QUALITY |"
+            echo "| Dependency Analysis | $(icon "$DEPENDENCIES") $DEPENDENCIES |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          for result in "$BRANCH" "$QUALITY" "$DEPENDENCIES"; do
+            if [[ "$result" != "success" && "$result" != "skipped" ]]; then
+              echo "::error::Uma ou mais validações falharam."
+              exit 1
+            fi
+          done
+
   # CD do banco. O deploy da aplicação é feito pelo Railway, que com "Wait for CI" só publica o
   # commit depois que este workflow inteiro passa — então a migração sempre roda ANTES do código
   # novo subir, e uma migração que falha barra o deploy.
   migrate-production:
-    name: migrate-production
+    name: Migrate Production
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [test, migrations, docker]
+    needs: [summary]
     runs-on: ubuntu-latest
     environment: production
     concurrency:

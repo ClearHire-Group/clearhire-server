@@ -71,7 +71,7 @@ func checkDecompressionBomb(data []byte) error {
 		if zr, err := zlib.NewReader(bytes.NewReader(body)); err == nil {
 			// remaining+1: se conseguir ler um byte a mais que o permitido, estourou.
 			n, _ := io.Copy(io.Discard, io.LimitReader(zr, remaining+1))
-			zr.Close()
+			_ = zr.Close() // só leitura: o que importa é quantos bytes saíram
 			if n > remaining {
 				return ErrPDFBomb
 			}
