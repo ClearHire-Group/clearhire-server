@@ -170,7 +170,7 @@ func (a *Adapter) complete(ctx context.Context, req chatRequest) (*chatResponse,
 	if err != nil {
 		return nil, llm.ErrProviderUnavailable
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }() // só leitura: erro no Close não muda nada
 	// Limite defensivo: uma resposta legítima tem poucos KB.
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {

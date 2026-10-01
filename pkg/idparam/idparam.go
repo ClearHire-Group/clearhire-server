@@ -17,7 +17,8 @@ import (
 func Valid(c *fiber.Ctx, name string) (id string, ok bool) {
 	id = c.Params(name)
 	if _, err := uuid.Parse(id); err != nil {
-		response.Err(c, fiber.StatusBadRequest, "identificador inválido")
+		// Falha aqui é da escrita da resposta, e o chamador já vai abortar com ok=false de qualquer jeito.
+		_ = response.Err(c, fiber.StatusBadRequest, "identificador inválido")
 		return "", false
 	}
 	return id, true

@@ -1,0 +1,5 @@
+# LF no working copy em qualquer SO. Com core.autocrlf=true (padrão no Git for Windows) o checkout
+# vira CRLF: gofmt passa a acusar todo arquivo e o testdata/resume.pdf é corrompido, quebrando os
+# testes de pkg/llm localmente enquanto o CI (Linux) passa.
+* text=auto eol=lf
+*.pdf binary
